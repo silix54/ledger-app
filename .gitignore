@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# Personal ledger data - never commit real financial exports
+ledger-backup.json
+ledger-backup-*.json
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
