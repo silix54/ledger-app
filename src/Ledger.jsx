@@ -1,4 +1,5 @@
-// Version: 6.9 - Master Seed Auto-Categorization Dataset
+// Version: 6.9.1 - Auto-Categorization Engine Fixes (dual raw/normalized regex test, stateless
+// regex flags, expanded Transport regex coverage, Manual Form live-suggestion reset)
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
 import { BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
@@ -321,7 +322,16 @@ function parseRegexRule(key) {
   const m = REGEX_RULE_SHAPE.exec(key);
   if (!m) return null;
   try {
-    return new RegExp(m[1], m[2]);
+    // Strip "g"/"y" (global/sticky) before compiling - both make RegExp#test() stateful via
+    // lastIndex, carrying a partial match position over between separate .test() calls on the same
+    // object. That's harmless for a one-off test, but categorize() below now tests a regex-shaped
+    // rule against both the raw and normalized merchant text in the same call, and Tier 2's
+    // DEFAULT_LOOKUP_COMPILED regexes are compiled once and reused across every categorize() call for
+    // every transaction - either "g" or "y" would silently corrupt matching (a match found on one
+    // call/test can suppress or skew the very next one) rather than behaving like the same stateless
+    // pattern every time. Any other flag (currently just "i") passes through unchanged.
+    const flags = m[2].replace(/[gy]/g, "");
+    return new RegExp(m[1], flags);
   } catch {
     // Invalid pattern syntax is routine, expected user input here (not an environment failure worth
     // logging like the other catches in this file) - silently treated as "never matches."
@@ -419,6 +429,14 @@ const DEFAULT_LOOKUP = [
     "flair air", "wheeltrans", "muni san francisco", "bart bay area", "septa philadelphia",
     "mta new york", "cta chicago", "wmata washington", "marta atlanta", "sound transit seattle",
     "king county metro", "denver rtd", "dart dallas",
+    // Two regex-shaped catch-alls (v6.9.1) layered on top of the plain-text keys above: each covers a
+    // cluster of common spelling/spacing variants (with vs. without a space, "prestocard" vs. "presto
+    // card", a hyphen vs. a space) a single plain substring key can't - see REGEX_RULE_SHAPE/
+    // isRegexRuleKey/parseRegexRule above for how a "/pattern/flags" string is detected and compiled.
+    // Transit systems/apps + micromobility/carshare:
+    "/presto|prestocard|oc\\s*transpo|octranspo|ttc|translink|stm|go\\s*transit|gotransit|metrolinx|up\\s*express|upexpress|via\\s*rail|viarail|amtrak|calgary\\s*transit|edmonton\\s*transit|exo\\s*train|bixi|lime\\s*bike|bird\\s*scooter|communauto|zipcar|turo|evo\\s*car/i",
+    // Fuel brands + parking operators:
+    "/esso|petro\\s*canada|petro-canada|petrocan|shell|chevron|pioneer\\s*energy|canadian\\s*tire\\s*gas|husky\\s*oil|ultramar|green\\s*p|parkopedia|impark|precise\\s*parklink|honkmobile|paybyphone/i",
   ]),
   ...seedRules("Subscriptions", [
     "netflix", "spotify", "disney plus", "amazon prime", "apple.com/bill", "icloud storage",
@@ -565,34 +583,44 @@ const DEFAULT_LOOKUP_COMPILED = compileDefaultLookup(DEFAULT_LOOKUP);
 // matches the FIRST key it hits, so more specific plain keys (e.g. "amazon.ca prime") must be listed
 // before broader ones (e.g. "amazon.ca") or the broad key wins by accident.
 //
-// A regex-shaped key (see REGEX_RULE_SHAPE above) is tested against the RAW merchant text, not the
-// normalized/lowercased text a plain substring key matches against - that's what lets the rule's own
-// flags (e.g. including or omitting /i) actually control case sensitivity, the way a hand-written
-// regex normally would. An invalid regex-shaped key just never matches (parseRegexRule already caught
-// the construction error) and categorization moves on to the next rule, rather than falling back to a
-// literal substring search for something like "/uber(/i" that could never usefully match anyway.
+// A regex-shaped key (see REGEX_RULE_SHAPE above) is tested against BOTH the RAW merchant text and the
+// normalized/lowercased text a plain substring key matches against (v6.9.1) - raw first (so a pattern
+// written with an explicit /i still controls case sensitivity the way a hand-written regex normally
+// would), normalized text second, as a fallback for a pattern that assumes already-normalized input
+// (e.g. a `\s*` meant to bridge a hyphen `normalize()` would have turned into a space, or a plain
+// lowercase pattern intended to match regardless of the merchant string's actual casing). Either side
+// matching is enough. `parseRegexRule` already strips the "g"/"y" flags before compiling specifically so
+// this dual test - two separate `.test()` calls against the same compiled RegExp - can never behave
+// inconsistently between the raw attempt and the normalized-text attempt. An invalid regex-shaped key
+// just never matches (parseRegexRule already caught the construction error) and categorization moves on
+// to the next rule, rather than falling back to a literal substring search for something like
+// "/uber(/i" that could never usefully match anyway.
 //
 // Tier 2 fallback (v6.9): if no rule in the person's own lookupEntries matches, categorize() falls
 // through to DEFAULT_LOOKUP_COMPILED - the built-in Master Seed Auto-Categorization Dataset above -
-// using the identical regex-vs-plain matching rules (regex against raw, plain against normalized text).
-// A user rule always wins outright: this loop only ever runs after the lookupEntries loop has already
-// exhausted every entry with no match, so nothing here can ever override or race a person's own rule,
-// however that rule was authored (a specific override the dataset also happens to contain a broader
-// entry for still resolves correctly, since Tier 1 exits first).
+// using the identical regex-vs-plain matching rules just described (regex against raw-or-normalized,
+// plain against normalized text). A user rule always wins outright: this loop only ever runs after the
+// lookupEntries loop has already exhausted every entry with no match, so nothing here can ever override
+// or race a person's own rule, however that rule was authored (a specific override the dataset also
+// happens to contain a broader entry for still resolves correctly, since Tier 1 exits first). Every
+// category string used in DEFAULT_LOOKUP is one of the exact strings in DEFAULT_SPENDING_CATEGORIES/
+// SYSTEM_CATEGORIES above (e.g. "Transport") - not a new, ad hoc label - so a Tier 2 match always lands
+// on a category that already exists in Settings, the category filters, and every chart that groups by
+// category.
 function categorize(merchant, lookupEntries) {
   const raw = String(merchant || "");
   const text = normalize(merchant);
   for (const [key, cat] of lookupEntries) {
     if (isRegexRuleKey(key)) {
       const regex = parseRegexRule(key);
-      if (regex && regex.test(raw)) return { category: cat, norm: key, matched: true };
+      if (regex && (regex.test(raw) || regex.test(text))) return { category: cat, norm: key, matched: true };
       continue;
     }
     if (text.includes(key)) return { category: cat, norm: key, matched: true };
   }
   for (const entry of DEFAULT_LOOKUP_COMPILED) {
     if (entry.regex) {
-      if (entry.regex.test(raw)) return { category: entry.cat, norm: raw, matched: true };
+      if (entry.regex.test(raw) || entry.regex.test(text)) return { category: entry.cat, norm: raw, matched: true };
     } else if (text.includes(entry.text)) {
       return { category: entry.cat, norm: entry.text, matched: true };
     }
@@ -1344,7 +1372,13 @@ function ManualTransactionForm({ categories, lookup, addCategory, onStage, onAdd
   // Live categorization: the exact same regex/substring rules engine every keystroke that staging's
   // "suggested" column already uses (see categorize()/stageRows above).
   const suggestedCategory = useMemo(() => categorize(description, lookup).category || "", [description, lookup]);
-  const category = categoryTouched ? manualCategory : suggestedCategory;
+  // v6.9.1: only a genuine manual pick (categoryTouched AND a real, non-blank manualCategory) locks the
+  // field - selecting the select's own blank "No match/Choose one" option still sets categoryTouched
+  // but leaves manualCategory empty, and that shouldn't freeze the field against further live
+  // suggestions as the description keeps changing. This is still a derived value, not state synced via
+  // an effect, so there's no render-cascade risk either way.
+  const hasManualCategory = categoryTouched && manualCategory !== "";
+  const category = hasManualCategory ? manualCategory : suggestedCategory;
 
   function resetForm() {
     setDate(todayDateString());
@@ -1355,6 +1389,13 @@ function ManualTransactionForm({ categories, lookup, addCategory, onStage, onAdd
     setNewCategoryName("");
     setTxnType("expense");
     setAmountText("");
+  }
+
+  // Lets the person undo a manual category pick and go back to live auto-detection without touching
+  // the rest of the form (date/description/amount/type all stay exactly as entered) or reloading.
+  function resetToSuggested() {
+    setManualCategory("");
+    setCategoryTouched(false);
   }
 
   function buildRow() {
@@ -1402,12 +1443,20 @@ function ManualTransactionForm({ categories, lookup, addCategory, onStage, onAdd
       <div>
         <div style={label}>Category</div>
         {!addingCategory ? (
-          <select value={category} onChange={e => handleCategorySelect(e.target.value)}
-            style={{ ...input, borderColor: !category ? "var(--border-warning)" : "var(--border)" }}>
-            <option value="">{description ? "No match - choose one" : "Choose a category..."}</option>
-            {categories.map(c => <option key={c} value={c}>{c}</option>)}
-            <option value="__new__">+ Add new category...</option>
-          </select>
+          <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+            <select value={category} onChange={e => handleCategorySelect(e.target.value)}
+              style={{ ...input, flex: 1, borderColor: !category ? "var(--border-warning)" : "var(--border)" }}>
+              <option value="">{description ? "No match - choose one" : "Choose a category..."}</option>
+              {categories.map(c => <option key={c} value={c}>{c}</option>)}
+              <option value="__new__">+ Add new category...</option>
+            </select>
+            {hasManualCategory && (
+              <button type="button" style={{ ...btn, padding: "8px" }} onClick={resetToSuggested}
+                title="Reset to suggested category" aria-label="Reset to suggested category">
+                <Undo2 size={14} />
+              </button>
+            )}
+          </div>
         ) : (
           <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
             <input value={newCategoryName} onChange={e => setNewCategoryName(e.target.value)} placeholder="New category name" style={{ ...input, flex: 1, minWidth: "160px" }} autoFocus
@@ -3870,7 +3919,9 @@ function RegexRuleTester() {
   const shaped = trimmedPattern !== "" && isRegexRuleKey(trimmedPattern);
   const regex = shaped ? parseRegexRule(trimmedPattern) : null;
   const invalidSyntax = shaped && !regex;
-  const match = regex ? regex.exec(sample) : null;
+  // Mirrors categorize()'s own dual raw-then-normalized-text test (v6.9.1) so this preview stays
+  // exactly what the rule would do once saved, not a narrower approximation of it.
+  const match = regex ? (regex.exec(sample) || regex.exec(normalize(sample))) : null;
 
   return (
     <div style={{ ...card, background: "var(--surface-2)", marginBottom: "12px" }}>

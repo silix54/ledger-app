@@ -776,6 +776,39 @@ check false positives/negatives at scale, no unit tests for `categorize()`'s Tie
 `compileDefaultLookup`. Same "build/lint-checked, not live-verified" caveat every other unverified item
 in §5 carries.
 
+**v6.9.1 fixes, on top of the above:**
+
+- **Regex rules are now tested against both the raw merchant text and the normalized (lowercased,
+  hyphens-to-spaces) text** — either side matching is enough, at both tiers. Raw is tried first (so a
+  pattern authored with an explicit `/i` still controls case sensitivity the way a hand-written regex
+  normally would); normalized text is tried second, as a fallback for a pattern that assumes
+  already-normalized input (e.g. a `\s*` meant to bridge a hyphen `normalize()` would have turned into a
+  space).
+- **`parseRegexRule` now strips `g`/`y` (global/sticky) flags before compiling.** Both make
+  `RegExp#test()`/`exec()` stateful via `lastIndex` — harmless for a single one-off test, but a real bug
+  risk now that a regex-shaped rule is tested twice per `categorize()` call (raw, then normalized) and
+  Tier 2's `DEFAULT_LOOKUP_COMPILED` regexes are compiled once and reused across every transaction's
+  `categorize()` call for the lifetime of the page. Any other flag (currently just `i`) passes through
+  unchanged. `RegexRuleTester` (Settings > Merchant rules) mirrors the same dual raw/normalized test so
+  its preview stays exactly what a rule would do once saved.
+- **Expanded Transport regex coverage**: two new regex-shaped `DEFAULT_LOOKUP` entries layered on top of
+  the existing plain-text Transport keys — one covering transit systems/apps and micromobility/carshare
+  (PRESTO, OC Transpo, TTC, TransLink, STM, GO Transit, Metrolinx, UP Express, VIA Rail, Amtrak, Calgary/
+  Edmonton Transit, Exo, Bixi, Lime, Bird, Communauto, Zipcar, Turo, Evo), the other covering fuel brands
+  and parking operators (Esso, Petro-Canada, Shell, Chevron, Pioneer, Canadian Tire Gas+, Husky,
+  Ultramar, Green P, Parkopedia, Impark, Precise ParkLink, HonkMobile, PayByPhone) — each pattern
+  collapsing several real-world spelling/spacing variants (with/without a space, a hyphen vs. a space)
+  that a single plain substring key can't.
+- **Manual Form (§3's Ingestion Mode & Manual Entry) live-suggestion fix**: the category field now only
+  locks against further live suggestions once the person has picked a *real* category — selecting the
+  form's own blank "No match/choose one" option sets `categoryTouched` but leaves the category empty,
+  and that no longer freezes the field against `categorize()`'s live suggestion as the description keeps
+  changing. A small reset icon (reusing the `Undo2` icon already used for "Undo last import") appears
+  next to the category dropdown whenever a real manual pick is in effect, clearing it back to live
+  auto-detection without touching the rest of the form or reloading.
+- Verified the same way as the rest of v6.9: `npm run build` clean, `npm run lint` unchanged (still
+  exactly the 9 pre-existing baseline errors).
+
 ---
 
 ## 4. Version Archive Index
@@ -1087,7 +1120,8 @@ pick which file to restore from if a rollback is ever needed.
 ## 5. Current State
 
 The current master component is **`src/Ledger.jsx`** — version comment
-`// Version: 6.9 - Master Seed Auto-Categorization Dataset`,
+`// Version: 6.9.1 - Auto-Categorization Engine Fixes (dual raw/normalized regex test, stateless
+regex flags, expanded Transport regex coverage, Manual Form live-suggestion reset)`,
 component export `export default function Ledger()`, rendered from `src/App.jsx`. The prior v6.1
 snapshot ("Final Phase 3," all Phase 3 roadmap items complete and verified — unit tests for every
 migration/validation function, a full regression suite across prior versions' features, and a
