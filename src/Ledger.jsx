@@ -1,6 +1,5 @@
-// Version: 6.9.7 - Multi-account tracking: optional Account field on every transaction, CSV
-// filename/content account auto-detect, staging/Manual Form account inputs, and a Log tab Account
-// column + filter
+// Version: 6.9.8 - Refined staging duplicate detection: exact/substring/" - "-split merchant match
+// (sign-agnostic, replacing the looser word-token-overlap heuristic), plus a "Hide duplicates" toggle
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
 import { BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
@@ -306,31 +305,39 @@ function dedupeAgainstCommitted(rows, committed) {
   return { kept, duplicateCount };
 }
 
-// Splits a merchant/description string into its "significant" word tokens - lowercased, punctuation
-// stripped (via normalize()), dropping anything under 3 characters (POS terminal codes, "#4821"-
-// style store numbers, single initials) - so two spellings of the same merchant ("TIM HORTONS #4821"
-// vs "Tim Hortons - Main St") still overlap on the words that actually identify who it was.
-function significantTokens(text) {
-  return normalize(text).split(" ").filter(w => w.length >= 3);
+// The part of a merchant string before its first " - " location/branch separator (e.g. "SPOTIFY
+// P45BDF0ACD - Stockholm" -> "SPOTIFY P45BDF0ACD"), normalized. Split on the RAW string and only
+// normalize what's left - not the other way around - because normalize() itself collapses every "-"
+// to a space, which would destroy the very separator this is looking for before it ever got to look.
+function baseMerchantName(text) {
+  const raw = String(text || "");
+  const idx = raw.indexOf(" - ");
+  return normalize(idx === -1 ? raw : raw.slice(0, idx));
 }
 
 // Looser duplicate test than fingerprint()'s exact match, used by CSV/paste staging to FLAG (not
 // silently exclude) a row that's likely already in the log: same date, same magnitude - Math.abs, so
 // a row imported once normally and once with an inverted sign (see the Credit Card mode toggle)
-// still gets caught - and merchant text that either contains the other or shares a real word in
-// common. Deliberately more permissive than fingerprint's exact-string dedup, which stays strict
-// enough to safely auto-exclude a row without a person ever seeing it; this one only ever suggests,
-// via a badge the person can override by checking the row back in (see stageRows/commitStaging).
+// still gets caught - and a merchant match by exact text, substring containment either direction, or
+// shared base name across a " - " location/branch suffix (see baseMerchantName). Deliberately more
+// permissive than fingerprint's exact-string dedup, which stays strict enough to safely auto-exclude
+// a row without a person ever seeing it; this one only ever suggests, via a badge the person can
+// override by checking the row back in (see stageRows/commitStaging).
 function looksLikeDuplicateOf(row, existing) {
   if (row.date !== existing.date) return false;
   if (!Number.isFinite(row.amount) || !Number.isFinite(existing.amount)) return false;
   if (Math.abs(row.amount).toFixed(2) !== Math.abs(existing.amount).toFixed(2)) return false;
-  const a = normalize(row.merchant || row.description || "");
-  const b = normalize(existing.merchant || existing.description || "");
+
+  const rowRaw = row.merchant || row.description || "";
+  const existingRaw = existing.merchant || existing.description || "";
+  const a = normalize(rowRaw);
+  const b = normalize(existingRaw);
   if (!a || !b) return false;
-  if (a.includes(b) || b.includes(a)) return true;
-  const tokensA = new Set(significantTokens(a));
-  return significantTokens(b).some(w => tokensA.has(w));
+  if (a === b) return true; // exact match
+  if (a.includes(b) || b.includes(a)) return true; // substring match, either direction
+
+  const baseA = baseMerchantName(rowRaw);
+  return !!baseA && baseA === baseMerchantName(existingRaw); // split match on " - "
 }
 
 const MAX_IMPORT_BYTES = 25 * 1024 * 1024;
@@ -2092,6 +2099,11 @@ export default function Ledger() {
 
   // Every new statement lands in staging first - nothing reaches the permanent log until confirmed.
   const [staging, setStaging] = useState([]);
+  // Declutters the staging table by default - a row flagged isDuplicate (see looksLikeDuplicateOf)
+  // is already excluded from commitStaging regardless of this toggle, so hiding it here is purely a
+  // display choice, not a second inclusion gate. Switching it off doesn't touch `included` on any
+  // row, so a duplicate someone had already checked back in stays checked once it's visible again.
+  const [hideDuplicates, setHideDuplicates] = useState(true);
   // Rows a CSV/paste import couldn't parse automatically (bad date, unreadable amount, blank
   // merchant) - kept around with their raw values and a human-readable reason instead of being
   // silently dropped, so the Log tab's "review & fix" drawer can offer them back for a quick manual
@@ -3091,6 +3103,11 @@ export default function Ledger() {
   // duplicate flag sitting in staging with no category yet isn't something to warn about.
   const stagingUnmatchedCount = staging.filter(r => r.included && !r.category).length;
   const stagingIncludedCount = staging.filter(r => r.included).length;
+  const stagingDuplicateCount = staging.filter(r => r.isDuplicate).length;
+  // What the table actually renders - "Hide duplicates" (default on) is a pure display filter, not
+  // a second inclusion gate, so a hidden row's `included` flag is untouched and still counts toward
+  // stagingIncludedCount/commitStaging above.
+  const visibleStaging = hideDuplicates ? staging.filter(r => !r.isDuplicate) : staging;
 
   function copyStagingList() {
     const list = [...new Set(staging.filter(r => r.included && !r.category).map(r => normalize(r.merchant)))];
@@ -3980,20 +3997,32 @@ export default function Ledger() {
                   {stagingUnmatchedCount > 0 && <AlertCircle size={15} color="var(--text-warning)" />}
                   {staging.length} new transaction{staging.length !== 1 ? "s" : ""} ready to review
                   {stagingIncludedCount !== staging.length && ` - ${stagingIncludedCount} checked to add`}
+                  {stagingDuplicateCount > 0 && ` - ${stagingDuplicateCount} duplicate${stagingDuplicateCount !== 1 ? "s" : ""} flagged`}
                   {stagingUnmatchedCount > 0 && ` - ${stagingUnmatchedCount} unmatched`}
                 </div>
-                <div style={{ display: "flex", gap: "8px" }}>
+                <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+                  {stagingDuplicateCount > 0 && (
+                    <label style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "12px", color: "var(--text-secondary)", cursor: "pointer" }}>
+                      <input type="checkbox" checked={hideDuplicates} onChange={e => setHideDuplicates(e.target.checked)} />
+                      Hide duplicates
+                    </label>
+                  )}
                   {stagingUnmatchedCount > 0 && <button style={btn} onClick={() => navigator.clipboard?.writeText(copyStagingList())?.catch(() => alert("Couldn't copy automatically - your browser blocked clipboard access. Select the list manually instead."))}><Copy size={13} /> Copy unmatched for LLM</button>}
                   <button style={btn} onClick={discardStaging}>Discard all</button>
                   <button style={{ ...btnPrimary, opacity: stagingIncludedCount ? 1 : 0.5 }} disabled={!stagingIncludedCount} onClick={commitStaging}><Check size={14} /> Confirm & add {stagingIncludedCount}</button>
                 </div>
               </div>
-              <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 10px" }}>Every category below is auto-suggested from your merchant lookup table. Change any of them before confirming - nothing here touches your permanent log until you click Confirm. Rows flagged as possible duplicates start unchecked; check one back in if it's actually new.</p>
+              <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 10px" }}>Every category below is auto-suggested from your merchant lookup table. Change any of them before confirming - nothing here touches your permanent log until you click Confirm. Rows flagged as possible duplicates start unchecked and are excluded from "Confirm & add"; check one back in if it's actually new.</p>
               <div style={{ overflowX: "auto", maxHeight: "420px", overflowY: "auto" }}>
                 <table style={{ width: "100%", borderCollapse: "collapse" }}>
                   <thead><tr><th style={th}></th><th style={th}>Date</th><th style={th}>Merchant</th><th style={{ ...th, textAlign: "right" }}>Amount</th><th style={th}>Category</th><th style={th}></th></tr></thead>
                   <tbody>
-                    {staging.map(r => (
+                    {visibleStaging.length === 0 && (
+                      <tr><td colSpan={6} style={{ ...td, textAlign: "center", color: "var(--text-muted)" }}>
+                        All {staging.length} staged row{staging.length !== 1 ? "s are" : " is"} flagged as a duplicate and hidden - uncheck "Hide duplicates" above to review.
+                      </td></tr>
+                    )}
+                    {visibleStaging.map(r => (
                       <tr key={r.stageId} style={r.isDuplicate ? { opacity: r.included ? 1 : 0.65 } : undefined}>
                         <td style={td}><input type="checkbox" checked={!!r.included} onChange={() => toggleStagingIncluded(r.stageId)}
                           aria-label={`Include ${r.merchant} in this import`} /></td>
