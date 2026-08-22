@@ -1,6 +1,8 @@
-// Version: 6.9.9 - Fixed credit card auto-detect: chequing/debit/savings accounts now always force
-// Invert Signs off, polarity heuristic keys off retail-row majority instead of payment keywords
-// alone, and the toggle fully resets on every new ingest instead of leaking across imports
+// Version: 6.9.10 - Smart header-row detection skips preamble/metadata rows above the real CSV
+// header (scans first 10 rows for 2+ column keywords); added YYYYMMDD/YYMMDD compact date parsing;
+// Date/Amount column auto-mapping now matches priority alias lists ("Transaction Date"/"Transaction
+// Amount" etc.) instead of only exact "date"/"amount"; BMO Mastercard exports are now auto-detected
+// and default to a named "BMO Mastercard" account
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
 import { BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
@@ -385,6 +387,16 @@ function parseFlexibleDate(raw) {
   let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
   if (m) return toISODate(+m[1], +m[2], +m[3]);
 
+  // Unseparated compact dates some POS/legacy exports use, checked before the punctuated formats
+  // below since those all require a separator or letters and can't otherwise collide with a bare
+  // digit run. YYYYMMDD is unambiguous; YYMMDD's 2-digit year is always read as 20YY - a compact
+  // 6-digit date is realistically never from last century, so there's no real ambiguity to pivot on.
+  m = s.match(/^(\d{4})(\d{2})(\d{2})$/); // YYYYMMDD
+  if (m) return toISODate(+m[1], +m[2], +m[3]);
+
+  m = s.match(/^(\d{2})(\d{2})(\d{2})$/); // YYMMDD -> 20YY-MM-DD
+  if (m) return toISODate(2000 + (+m[1]), +m[2], +m[3]);
+
   m = s.match(/^(\d{1,2})[\s\-/]+([A-Za-z]{3,9})[\s\-/,]+(\d{4})$/); // "22-AUG-2026", "22 Aug, 2026"
   if (m && MONTH_NAMES[m[2].toLowerCase()]) return toISODate(+m[3], MONTH_NAMES[m[2].toLowerCase()], +m[1]);
 
@@ -465,20 +477,32 @@ function looksLikeCreditCardFormat(rows) {
   return positive > retail.length - positive;
 }
 
+// BMO Mastercard exports carry this exact quartet of column headers ("Item #", "Card #",
+// "Transaction Date", "Transaction Amount") and no bank name anywhere in the file, so the generic
+// CREDIT_ACCOUNT_HINT below never fires for them - this checks for the header quartet specifically,
+// ahead of the generic checks, so those files still get a named-account guess instead of "".
+function looksLikeBMOExport(text) {
+  return /card\s*#/i.test(text) && /item\s*#/i.test(text)
+    && /transaction\s*date/i.test(text) && /transaction\s*amount/i.test(text);
+}
+
 // Account auto-detect for a single uploaded CSV (handleCSV): checks the file's own name plus its
-// first few lines - some bank exports carry an account-type line ("Account Type,Visa Infinite", a
+// first several lines - some bank exports carry an account-type line ("Account Type,Visa Infinite", a
 // branch/product name, etc.) above the real column headers - for words that name a credit product
 // vs a chequing/debit product. "scotiabank" in the same text upgrades the generic guess to a
 // specifically-named account; without it, the generic name is returned so this doesn't invent a
 // bank the file never mentioned. Returns "" when neither pattern matches, meaning "no guess" - the
 // Account field is left for the person to fill in themselves rather than defaulting to something
 // arbitrary. Not run for "Select folder" (many files, potentially many different accounts at once)
-// or paste (no file to inspect at all).
+// or paste (no file to inspect at all). Scans 10 lines, not just the first couple, to stay ahead of
+// preamble/metadata rows that can push the real header row (and any bank-name hints near it) further
+// down the file - see findHeaderRowIndex's matching scan window.
 const CREDIT_ACCOUNT_HINT = /visa|mastercard|amex|credit/i;
 const CHEQUING_ACCOUNT_HINT = /chequing|checking|debit|savings/i;
 function guessAccountFromFile(filename, rawText) {
-  const topLines = (rawText || "").split("\n").slice(0, 5).join("\n");
+  const topLines = (rawText || "").split("\n").slice(0, 10).join("\n");
   const haystack = `${filename || ""}\n${topLines}`;
+  if (looksLikeBMOExport(haystack)) return "BMO Mastercard";
   const isScotiabank = /scotiabank/i.test(haystack);
   if (CREDIT_ACCOUNT_HINT.test(haystack)) return isScotiabank ? "Scotiabank Visa" : "Credit Card";
   if (CHEQUING_ACCOUNT_HINT.test(haystack)) return isScotiabank ? "Scotiabank Chequing" : "Chequing";
@@ -492,6 +516,50 @@ function guessAccountFromFile(filename, rawText) {
 // stageRowsWithSignDetection, the only caller.
 function isChequingLikeAccount(text) {
   return CHEQUING_ACCOUNT_HINT.test(text || "");
+}
+
+// Some exports (BMO among them) put an account summary, a disclaimer, or a blank spacer row above
+// the real column header row, so Row 0 isn't reliably the header - these three functions locate the
+// real one instead of assuming it. A row counts as "the header" once at least two of its cells
+// contain one of these column-name keywords (a single hit is too weak a signal: a preamble line like
+// "Statement Date,2026-08-01" would false-positive on "date" alone). Only the first 10 rows are
+// scanned - a header buried deeper than that isn't a preamble anymore, it's a malformed file - and if
+// nothing qualifies, row 0 is used as a safe fallback (unchanged behaviour for every normal file that
+// already puts its header on row 0).
+const HEADER_ROW_KEYWORDS = ["date", "description", "amount", "item #", "card #", "debit", "credit", "merchant"];
+function looksLikeHeaderRow(fields) {
+  const hits = (fields || []).filter(f => {
+    const cell = String(f ?? "").trim().toLowerCase();
+    return HEADER_ROW_KEYWORDS.some(kw => cell.includes(kw));
+  });
+  return hits.length >= 2;
+}
+function findHeaderRowIndex(rawRows) {
+  const scanLimit = Math.min(rawRows.length, 10);
+  for (let i = 0; i < scanLimit; i++) {
+    if (looksLikeHeaderRow(rawRows[i])) return i;
+  }
+  return 0;
+}
+
+// Header-less (array-of-rows) parse of raw CSV text, followed by manual re-keying from whichever row
+// findHeaderRowIndex identifies as the real header - the same shape Papa.parse's own header:true mode
+// would have produced, but with any preamble/metadata rows above the header discarded instead of
+// mis-read as data (or, worse, mistaken for the header itself). Ragged rows (fewer cells than the
+// header) get "" for the missing trailing columns rather than undefined, so downstream `find()` calls
+// (which call .toString() on every field) never throw.
+function parseCSVWithHeaderDetection(text) {
+  const parsed = Papa.parse(text, { skipEmptyLines: true });
+  const rawRows = parsed.data;
+  if (!rawRows || rawRows.length === 0) return { data: [] };
+  const headerIdx = findHeaderRowIndex(rawRows);
+  const headerRow = rawRows[headerIdx].map(h => String(h ?? "").trim());
+  const data = rawRows.slice(headerIdx + 1).map(cols => {
+    const obj = {};
+    headerRow.forEach((h, i) => { obj[h] = cols[i] ?? ""; });
+    return obj;
+  });
+  return { data };
 }
 
 // A lookup key wrapped in slashes with optional trailing flags (e.g. "/^uber\s*eats/i") is a regex
@@ -2727,6 +2795,14 @@ export default function Ledger() {
   // the merchant slot away from the real primary column.
   const PRIMARY_TEXT_NAMES = ["description 1", "transaction description", "merchant", "payee", "main description", "name", "description", "desc"];
   const SECONDARY_TEXT_NAMES = ["sub-description", "sub description", "description 2", "memo", "location", "city", "address", "merchant/sub-description"];
+  // Same priority-list treatment as PRIMARY_TEXT_NAMES above, for the Date and Amount columns - a
+  // plain "Date"/"Amount" header is still the most common case (checked first), but "Transaction
+  // Date"/"Transaction Amount" (BMO and others) need to match too, or the file falls through to
+  // manual mapping despite being fully auto-readable. Order matters here as much as it does for
+  // PRIMARY_TEXT_NAMES: on a file with both a plain "Amount" and something like a "Transaction
+  // Amount" running total column, the exact "amount" match must win regardless of column order.
+  const DATE_NAMES = ["date", "transaction date", "posted date", "trans date"];
+  const AMOUNT_NAMES = ["amount", "transaction amount"];
 
   function extractRowsFromParsedCSV(res, filename) {
     const keys = res.data.length ? Object.keys(res.data[0]) : [];
@@ -2740,8 +2816,8 @@ export default function Ledger() {
       }
       return "";
     };
-    const hasDate = keys.some(k => k.toLowerCase().trim() === "date");
-    const hasAmount = keys.some(k => k.toLowerCase().trim() === "amount");
+    const hasDate = DATE_NAMES.some(name => keys.some(k => k.toLowerCase().trim() === name));
+    const hasAmount = AMOUNT_NAMES.some(name => keys.some(k => k.toLowerCase().trim() === name));
     // No single Amount column - fall back to a Debit/Credit (or Withdrawals/Deposits) pair, if the
     // file has one, before giving up and asking the person to map columns by hand.
     const hasDebitCredit = !hasAmount && (keys.some(k => DEBIT_NAMES.includes(k.toLowerCase().trim()))
@@ -2760,78 +2836,78 @@ export default function Ledger() {
         // secondary column is blank.
         const merchant = primaryText && secondaryText && secondaryText !== primaryText
           ? `${primaryText} - ${secondaryText}` : (primaryText || secondaryText);
-        const amount = hasAmount ? find(row, ["amount"]) : combineDebitCredit(find(row, DEBIT_NAMES), find(row, CREDIT_NAMES));
-        return { date: find(row, ["date"]), description: primaryText, merchant, amount };
+        const amount = hasAmount ? find(row, AMOUNT_NAMES) : combineDebitCredit(find(row, DEBIT_NAMES), find(row, CREDIT_NAMES));
+        return { date: find(row, DATE_NAMES), description: primaryText, merchant, amount };
       }),
     };
   }
 
-  // Account auto-detect (see guessAccountFromFile) needs the file's raw text, which Papa.parse's own
-  // result doesn't expose (only parsed rows). Read it with file.text() first, compute the guess
-  // synchronously from that, *then* parse - rather than reading the text in a parallel, unawaited
-  // .then() - so the guessed account can be handed straight to this same call's
+  // Reads the file's raw text once via file.text() and reuses it for both account auto-detect (see
+  // guessAccountFromFile) and header-detection-aware parsing (see parseCSVWithHeaderDetection) -
+  // Papa.parse's own File-mode result doesn't expose the raw text at all, so a single text() read
+  // now serves both needs instead of reading the file twice through two different APIs. The account
+  // guess is computed synchronously from that text, *then* handed straight to this same call's
   // stageRowsWithSignDetection instead of racing its own setStagingAccount() (which wouldn't commit
   // to state until a later render, and so would still read as empty if stageRows read it eagerly).
   // Only guesses when stagingAccount is still empty, so re-uploading a second statement right after
   // the first never silently overwrites whatever account the person already chose for this batch.
   async function handleCSV(file) {
+    let text;
+    try {
+      text = await file.text();
+    } catch (err) {
+      alert("Could not read that CSV file: " + err.message);
+      return;
+    }
     let guessedAccount = stagingAccount;
     if (!stagingAccount) {
-      try {
-        guessedAccount = guessAccountFromFile(file.name, await file.text());
-        if (guessedAccount) setStagingAccount(guessedAccount);
-      } catch { /* best-effort - a failed read here just means no auto-guess, not an error */ }
+      guessedAccount = guessAccountFromFile(file.name, text);
+      if (guessedAccount) setStagingAccount(guessedAccount);
     }
-    Papa.parse(file, {
-      header: true, skipEmptyLines: true,
-      error: (err) => alert("Could not read that CSV file: " + err.message),
-      complete: (res) => {
-        if (!res.data || res.data.length === 0) {
-          alert("That CSV didn't contain any rows Claude could read. Check it has Date, Description, Merchant, and Amount columns.");
-          return;
-        }
-        const result = extractRowsFromParsedCSV(res, file.name);
-        if (result.needsMapping) {
-          setPendingMapping(result);
-        } else {
-          stageRowsWithSignDetection(result.rows, guessedAccount, file.name);
-        }
-      },
-    });
+    const res = parseCSVWithHeaderDetection(text);
+    if (!res.data || res.data.length === 0) {
+      alert("That CSV didn't contain any rows Claude could read. Check it has Date, Description, Merchant, and Amount columns.");
+      return;
+    }
+    const result = extractRowsFromParsedCSV(res, file.name);
+    if (result.needsMapping) {
+      setPendingMapping(result);
+    } else {
+      stageRowsWithSignDetection(result.rows, guessedAccount, file.name);
+    }
   }
 
   // Selecting a whole folder (<input webkitdirectory>) hands back every file inside it. Filter to
   // CSVs, parse each, combine, and run through the same staging + dedup pipeline as a single upload -
   // re-selecting the same folder later just re-runs this and dedup silently skips what's unchanged.
-  function handleFolderSelect(fileList) {
+  // Async (Promise.all over each file's own text() + parse) rather than the old Papa.parse(file,...)
+  // + remaining-- counter, so every file gets the same header-detection-aware parsing handleCSV uses.
+  async function handleFolderSelect(fileList) {
     const csvFiles = Array.from(fileList).filter(f => f.name.toLowerCase().endsWith(".csv"));
     if (csvFiles.length === 0) {
       alert("No .csv files found in that folder.");
       return;
     }
-    let remaining = csvFiles.length;
     const allRows = [];
     const mappingNeeded = [];
-    csvFiles.forEach(file => {
-      Papa.parse(file, {
-        header: true, skipEmptyLines: true,
-        complete: (res) => {
-          if (res.data && res.data.length > 0) {
-            const result = extractRowsFromParsedCSV(res, file.name);
-            if (result.needsMapping) mappingNeeded.push(result);
-            else allRows.push(...result.rows);
-          }
-          remaining--;
-          if (remaining === 0) {
-            if (allRows.length) stageRowsWithSignDetection(allRows);
-            if (mappingNeeded.length) {
-              alert(`${mappingNeeded.length} file(s) couldn't be auto-read (no recognizable Date/Amount columns): ${mappingNeeded.map(m => m.filename).join(", ")}. Everything else was staged - you can add those separately.`);
-            }
-          }
-        },
-        error: () => { remaining--; },
-      });
-    });
+    await Promise.all(csvFiles.map(async file => {
+      let text;
+      try {
+        text = await file.text();
+      } catch {
+        return; // unreadable file - silently skipped, matching the old Papa.parse error: handler
+      }
+      const res = parseCSVWithHeaderDetection(text);
+      if (res.data && res.data.length > 0) {
+        const result = extractRowsFromParsedCSV(res, file.name);
+        if (result.needsMapping) mappingNeeded.push(result);
+        else allRows.push(...result.rows);
+      }
+    }));
+    if (allRows.length) stageRowsWithSignDetection(allRows);
+    if (mappingNeeded.length) {
+      alert(`${mappingNeeded.length} file(s) couldn't be auto-read (no recognizable Date/Amount columns): ${mappingNeeded.map(m => m.filename).join(", ")}. Everything else was staged - you can add those separately.`);
+    }
   }
 
   function handlePasteAdd() {
