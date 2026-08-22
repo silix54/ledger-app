@@ -1,5 +1,5 @@
-// Version: 6.9.2 - Dining no-space merchant coverage (Tim Hortons/Starbucks/McDonald's) & Manual
-// Form live-suggestion reset on description edit
+// Version: 6.9.3 - CSV import: prioritize primary Description/Merchant/Payee columns over
+// secondary Sub-Description/Location/Memo columns when auto-detecting the merchant field
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
 import { BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
@@ -2289,21 +2289,47 @@ export default function Ledger() {
     setStaging(prev => [...prev, ...kept]);
   }
 
+  // Ordered by how confidently a header names the transaction's actual merchant/description text,
+  // most confident first. "Description 1"/"Transaction Description"/"Merchant"/"Payee"/"Main
+  // Description"/"Name" all name the column a bank puts the real payee/merchant string in;
+  // "Sub-Description"/"Description 2"/"Memo"/"Location"/"City"/"Address" are companion columns some
+  // banks export alongside a primary one (usually a branch/location suffix), never a substitute for
+  // it. PRIMARY_TEXT_NAMES is checked in full before SECONDARY_TEXT_NAMES is ever consulted, so a
+  // CSV whose secondary column happens to appear earlier in the file's own column order can't steal
+  // the merchant slot away from the real primary column.
+  const PRIMARY_TEXT_NAMES = ["description 1", "transaction description", "merchant", "payee", "main description", "name", "description", "desc"];
+  const SECONDARY_TEXT_NAMES = ["sub-description", "sub description", "description 2", "memo", "location", "city", "address", "merchant/sub-description"];
+
   function extractRowsFromParsedCSV(res, filename) {
     const keys = res.data.length ? Object.keys(res.data[0]) : [];
-    const find = (row, names) => { const k = keys.find(k => names.includes(k.toLowerCase().trim())); return k ? row[k] : ""; };
-    const hasDate = keys.some(k => ["date"].includes(k.toLowerCase().trim()));
-    const hasAmount = keys.some(k => ["amount"].includes(k.toLowerCase().trim()));
+    // Matches `names` against the file's headers in priority order (the order names are listed
+    // in), not the file's own column order - so a lower-priority column appearing earlier in the
+    // CSV never wins over a higher-priority one appearing later.
+    const find = (row, names) => {
+      for (const name of names) {
+        const k = keys.find(k => k.toLowerCase().trim() === name);
+        if (k) return (row[k] ?? "").toString();
+      }
+      return "";
+    };
+    const hasDate = keys.some(k => k.toLowerCase().trim() === "date");
+    const hasAmount = keys.some(k => k.toLowerCase().trim() === "amount");
     if (!hasDate || !hasAmount) {
       return { needsMapping: true, headers: keys, rawRows: res.data, filename };
     }
     return {
       needsMapping: false,
-      rows: res.data.map(row => ({
-        date: find(row, ["date"]), description: find(row, ["description", "desc"]),
-        merchant: find(row, ["merchant", "sub-description", "merchant/sub-description"]) || find(row, ["description"]),
-        amount: find(row, ["amount"]),
-      })),
+      rows: res.data.map(row => {
+        const primaryText = find(row, PRIMARY_TEXT_NAMES).trim();
+        const secondaryText = find(row, SECONDARY_TEXT_NAMES).trim();
+        // Prefer the primary column outright; only fold the secondary one in when it adds real
+        // information (non-empty and not just a repeat of the primary text), so a merchant string
+        // never ends up as "Costco - Costco" or a trailing "Costco - " for rows where the
+        // secondary column is blank.
+        const merchant = primaryText && secondaryText && secondaryText !== primaryText
+          ? `${primaryText} - ${secondaryText}` : (primaryText || secondaryText);
+        return { date: find(row, ["date"]), description: primaryText, merchant, amount: find(row, ["amount"]) };
+      }),
     };
   }
 
