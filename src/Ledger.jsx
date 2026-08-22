@@ -1,5 +1,5 @@
-// Version: 6.9.5 - Credit card sign inversion: Invert Signs toggle (with auto-detect) on CSV/paste
-// staging, plus a batch Invert Sign action for already-committed transactions in the Log tab
+// Version: 6.9.6 - Resilient staging duplicate detection (flag + checkbox, not silent exclude),
+// "Delete all transactions" (Log tab), and "Clear Cache & Hard Reset" (Settings > Storage & Cache)
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
 import { BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
@@ -298,6 +298,33 @@ function dedupeAgainstCommitted(rows, committed) {
     }
   });
   return { kept, duplicateCount };
+}
+
+// Splits a merchant/description string into its "significant" word tokens - lowercased, punctuation
+// stripped (via normalize()), dropping anything under 3 characters (POS terminal codes, "#4821"-
+// style store numbers, single initials) - so two spellings of the same merchant ("TIM HORTONS #4821"
+// vs "Tim Hortons - Main St") still overlap on the words that actually identify who it was.
+function significantTokens(text) {
+  return normalize(text).split(" ").filter(w => w.length >= 3);
+}
+
+// Looser duplicate test than fingerprint()'s exact match, used by CSV/paste staging to FLAG (not
+// silently exclude) a row that's likely already in the log: same date, same magnitude - Math.abs, so
+// a row imported once normally and once with an inverted sign (see the Credit Card mode toggle)
+// still gets caught - and merchant text that either contains the other or shares a real word in
+// common. Deliberately more permissive than fingerprint's exact-string dedup, which stays strict
+// enough to safely auto-exclude a row without a person ever seeing it; this one only ever suggests,
+// via a badge the person can override by checking the row back in (see stageRows/commitStaging).
+function looksLikeDuplicateOf(row, existing) {
+  if (row.date !== existing.date) return false;
+  if (!Number.isFinite(row.amount) || !Number.isFinite(existing.amount)) return false;
+  if (Math.abs(row.amount).toFixed(2) !== Math.abs(existing.amount).toFixed(2)) return false;
+  const a = normalize(row.merchant || row.description || "");
+  const b = normalize(existing.merchant || existing.description || "");
+  if (!a || !b) return false;
+  if (a.includes(b) || b.includes(a)) return true;
+  const tokensA = new Set(significantTokens(a));
+  return significantTokens(b).some(w => tokensA.has(w));
 }
 
 const MAX_IMPORT_BYTES = 25 * 1024 * 1024;
@@ -1271,6 +1298,7 @@ const statBig = { fontSize: "26px", fontWeight: 600, letterSpacing: "-0.01em", .
 const statSmall = { fontSize: "18px", fontWeight: 600, letterSpacing: "-0.005em", ...num };
 const btn = { display: "inline-flex", alignItems: "center", gap: "6px", padding: "8px 14px", borderRadius: "var(--radius)", border: "1px solid var(--border-strong)", background: "var(--surface-1)", color: "var(--text-primary)", fontSize: "13px", fontWeight: 500, cursor: "pointer" };
 const btnPrimary = { ...btn, background: "var(--text-accent)", color: "#fff", border: "1px solid var(--text-accent)" };
+const btnDanger = { ...btn, background: "var(--text-danger)", color: "#fff", border: "1px solid var(--text-danger)" };
 const input = { width: "100%", padding: "8px 10px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "13px", background: "var(--surface-2)", color: "var(--text-primary)", boxSizing: "border-box" };
 const th = { textAlign: "left", padding: "10px 12px", fontSize: "11px", fontWeight: 600, letterSpacing: "0.03em", textTransform: "uppercase", color: "var(--text-secondary)", borderBottom: "1px solid var(--border)", whiteSpace: "nowrap" };
 const td = { padding: "10px 12px", fontSize: "13px", borderBottom: "1px solid var(--border)" };
@@ -1287,20 +1315,20 @@ const THEME_KEY = "ledger:theme:v1";
 const THEME_CSS = `
 .ledger-root {
   --surface-0: #f7f6f3; --surface-1: #ffffff; --surface-2: #f3f1ec;
-  --border: #e6e3dc; --border-strong: #d3cfc4; --border-warning: #e3b756;
+  --border: #e6e3dc; --border-strong: #d3cfc4; --border-warning: #e3b756; --border-danger: #e2a08f;
   --text-primary: #23211d; --text-secondary: #6f6b61; --text-muted: #969184;
   --text-accent: #b8502d; --text-success: #17805f; --text-warning: #96691a; --text-danger: #b8402b;
-  --bg-accent: #f7e7de; --bg-success: #e1f2ea; --bg-warning: #faf0d8;
+  --bg-accent: #f7e7de; --bg-success: #e1f2ea; --bg-warning: #faf0d8; --bg-danger: #fae4de;
   --radius: 10px;
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 }
 .ledger-root[data-theme="dark"] {
   --surface-0: #161513; --surface-1: #1e1c19; --surface-2: #27241f;
-  --border: #38352e; --border-strong: #4a453b; --border-warning: #6b5423;
+  --border: #38352e; --border-strong: #4a453b; --border-warning: #6b5423; --border-danger: #7a4232;
   --text-primary: #f2efe9; --text-secondary: #ada89d; --text-muted: #79756a;
   --text-accent: #e58156; --text-success: #4fc498; --text-warning: #dcae52; --text-danger: #e37360;
-  --bg-accent: #3a2a20; --bg-success: #1b3129; --bg-warning: #392c14;
+  --bg-accent: #3a2a20; --bg-success: #1b3129; --bg-warning: #392c14; --bg-danger: #3a221c;
 }
 .ledger-root, .ledger-root * { transition: background-color .15s ease, border-color .15s ease, color .15s ease; }
 .ledger-root button { cursor: pointer; }
@@ -1351,6 +1379,30 @@ const PRINT_CSS = `
   @page { margin: 0.75in; }
 }
 `;
+
+// Full-screen confirmation for "Delete all transactions" (Log tab header). Everything else
+// destructive in this app (row delete, category removal, merchant-rule deletion) uses a plain
+// window.confirm() - see CONTEXT.md - but wiping every transaction in one click is enough more
+// consequential that it gets its own visibly red modal instead, matching what was asked for here.
+function DeleteAllConfirmModal({ count, onConfirm, onCancel }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 9999, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center", padding: "20px" }}>
+      <div style={{ ...card, borderColor: "var(--border-danger)", maxWidth: "420px", width: "100%" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "10px" }}>
+          <AlertCircle size={18} color="var(--text-danger)" />
+          <div style={{ fontSize: "15px", fontWeight: 600, color: "var(--text-danger)" }}>Delete all transactions?</div>
+        </div>
+        <p style={{ fontSize: "13px", color: "var(--text-secondary)", margin: "0 0 18px" }}>
+          Are you sure you want to delete all transactions? This cannot be undone unless you have a backup.
+        </p>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
+          <button style={btn} onClick={onCancel}>Cancel</button>
+          <button style={btnDanger} onClick={onConfirm}><Trash2 size={14} /> Delete all {count}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function CategoryBadge({ category }) {
   let bg = "var(--bg-accent)", fg = "var(--text-accent)";
@@ -2503,13 +2555,22 @@ export default function Ledger() {
       }
     });
 
-    // Dedup against both what's already committed and what's already sitting in staging, so
-    // re-selecting the same folder (or the same file twice) never creates duplicate entries.
-    const { kept, duplicateCount } = dedupeAgainstCommitted(cleaned, [...transactions, ...staging]);
+    // Flag (not silently exclude) rows that look like they're already in the log - see
+    // looksLikeDuplicateOf for the fuzzy match criteria. Checked against both the permanent log and
+    // anything already sitting in staging from an earlier import this session, so re-selecting the
+    // same file twice in a row still gets caught. A flagged row starts unchecked (excluded from
+    // commitStaging) but stays visible with a "Duplicate (already in log)" badge so a person can
+    // still check it back in if it turns out to be a genuine repeat charge.
+    const existingPool = [...transactions, ...staging];
+    const kept = cleaned.map(r => {
+      const isDuplicate = existingPool.some(existing => looksLikeDuplicateOf(r, existing));
+      return { ...r, isDuplicate, included: !isDuplicate };
+    });
+    const duplicateCount = kept.filter(r => r.isDuplicate).length;
 
     const parts = [];
     if (failed.length > 0) parts.push(`${failed.length} row${failed.length !== 1 ? "s" : ""} could not be parsed automatically`);
-    if (duplicateCount > 0) parts.push(`${duplicateCount} duplicate row${duplicateCount !== 1 ? "s" : ""} already in your log, skipped`);
+    if (duplicateCount > 0) parts.push(`${duplicateCount} possible duplicate${duplicateCount !== 1 ? "s" : ""} flagged below - unchecked by default, review before confirming`);
     setImportWarning(parts.join(". "));
     if (failed.length) setSkippedRows(prev => [...prev, ...failed]);
 
@@ -2540,6 +2601,7 @@ export default function Ledger() {
     setStaging(prev => [...prev, {
       stageId: nextStageId.current++, date: fixed.date, description: fixed.merchant,
       merchant: fixed.merchant, amount: fixed.amount, suggested, category: fixed.category, matched: fixed.category === suggested,
+      isDuplicate: false, included: true, // already confirmed via confirmIfDuplicate above
     }]);
     setSkippedRows(prev => prev.filter(r => r.skipId !== skipId));
   }
@@ -2678,20 +2740,31 @@ export default function Ledger() {
     setStaging(prev => prev.map(r => r.stageId === stageId ? { ...r, category } : r));
   }
 
+  // Toggles a staged row's inclusion in the next commitStaging - the checkbox a person uses to
+  // override a "Duplicate (already in log)" flag they've decided was wrong, or to exclude a row
+  // they'd rather leave for later without fully discarding it (see removeStagingRow for that).
+  function toggleStagingIncluded(stageId) {
+    setStaging(prev => prev.map(r => r.stageId === stageId ? { ...r, included: !r.included } : r));
+  }
+
   function removeStagingRow(stageId) {
     setStaging(prev => prev.filter(r => r.stageId !== stageId));
   }
 
+  // Only checked ("included") rows are committed - an unchecked duplicate flag is left behind in
+  // staging rather than discarded, so a person who decides one really was new after all can still
+  // check it back in and commit again without re-importing the whole file.
   function commitStaging() {
+    const toCommit = staging.filter(r => r.included);
     // Upsert: the newest correction for a merchant replaces any older entry for the same key,
     // rather than piling a duplicate on top of it every time it's corrected again.
     const corrections = new Map();
-    staging.forEach(r => {
+    toCommit.forEach(r => {
       if (r.category && r.category !== r.suggested) {
         corrections.set(normalize(r.merchant), r.category);
       }
     });
-    const committed = staging.map(r => ({
+    const committed = toCommit.map(r => ({
       id: nextId.current++, date: r.date, description: r.description,
       merchant: r.merchant, amount: r.amount, category: r.category || null,
     }));
@@ -2702,7 +2775,7 @@ export default function Ledger() {
     // Replaces any previous batch - "last import" always means the one just committed, and any
     // row an earlier undo would have touched has either already been undone or is now moot.
     setLastImportBatch({ ids: new Set(committed.map(c => c.id)), count: committed.length });
-    setStaging([]);
+    setStaging(prev => prev.filter(r => !r.included));
   }
 
   // Rolls back exactly the batch from the most recent commitStaging call, leaving every other
@@ -2755,6 +2828,7 @@ export default function Ledger() {
     setStaging(prev => [...prev, {
       stageId: nextStageId.current++, date: row.date, description: row.description,
       merchant: row.merchant, amount: row.amount, suggested, category: row.category, matched: true,
+      isDuplicate: false, included: true, // already confirmed via confirmIfDuplicate above
     }]);
     return true;
   }
@@ -2921,10 +2995,13 @@ export default function Ledger() {
     setLookup(prev => prev.filter(([k]) => k !== key));
   }
 
-  const stagingUnmatchedCount = staging.filter(r => !r.category).length;
+  // Only rows actually headed for commitStaging need a category before confirming - an unchecked
+  // duplicate flag sitting in staging with no category yet isn't something to warn about.
+  const stagingUnmatchedCount = staging.filter(r => r.included && !r.category).length;
+  const stagingIncludedCount = staging.filter(r => r.included).length;
 
   function copyStagingList() {
-    const list = [...new Set(staging.filter(r => !r.category).map(r => normalize(r.merchant)))];
+    const list = [...new Set(staging.filter(r => r.included && !r.category).map(r => normalize(r.merchant)))];
     return `Categorize each of these merchant strings into exactly one of these categories:\n${allCategories.join(", ")}\n\nMerchants:\n${list.join("\n")}\n\nReturn as "merchant: category" one per line.`;
   }
 
@@ -3337,6 +3414,7 @@ export default function Ledger() {
   // paged/filtered, so it survives paging through a large result set to build up a batch.
   const [selectedTxnIds, setSelectedTxnIds] = useState(() => new Set());
   const [bulkCategory, setBulkCategory] = useState("");
+  const [showDeleteAllModal, setShowDeleteAllModal] = useState(false);
 
   function toggleTxnSelected(id) {
     setSelectedTxnIds(prev => {
@@ -3398,6 +3476,18 @@ export default function Ledger() {
     if (selectedTxnIds.size === 0) return;
     setTransactions(prev => prev.map(t => selectedTxnIds.has(t.id) ? { ...t, amount: -t.amount } : t));
     deselectAllTxns();
+  }
+
+  // Empties the entire transaction log, gated behind DeleteAllConfirmModal rather than this app's
+  // usual window.confirm() (see that component's comment). The autosave effect below mirrors
+  // `transactions` into localStorage on every change, so an empty array here persists on its own -
+  // no separate localStorage.setItem needed. Also clears the current selection and any pending
+  // "Undo last import" batch, since both would otherwise point at ids that no longer exist.
+  function deleteAllTransactions() {
+    setTransactions([]);
+    setSelectedTxnIds(new Set());
+    setLastImportBatch(null);
+    setShowDeleteAllModal(false);
   }
 
   // Sets dateFrom/dateTo to the first/last day of the chosen YYYY-MM month in one step, as a
@@ -3784,23 +3874,33 @@ export default function Ledger() {
                 <div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "13px", fontWeight: 500 }}>
                   {stagingUnmatchedCount > 0 && <AlertCircle size={15} color="var(--text-warning)" />}
                   {staging.length} new transaction{staging.length !== 1 ? "s" : ""} ready to review
+                  {stagingIncludedCount !== staging.length && ` - ${stagingIncludedCount} checked to add`}
                   {stagingUnmatchedCount > 0 && ` - ${stagingUnmatchedCount} unmatched`}
                 </div>
                 <div style={{ display: "flex", gap: "8px" }}>
                   {stagingUnmatchedCount > 0 && <button style={btn} onClick={() => navigator.clipboard?.writeText(copyStagingList())?.catch(() => alert("Couldn't copy automatically - your browser blocked clipboard access. Select the list manually instead."))}><Copy size={13} /> Copy unmatched for LLM</button>}
                   <button style={btn} onClick={discardStaging}>Discard all</button>
-                  <button style={btnPrimary} onClick={commitStaging}><Check size={14} /> Confirm & add {staging.length}</button>
+                  <button style={{ ...btnPrimary, opacity: stagingIncludedCount ? 1 : 0.5 }} disabled={!stagingIncludedCount} onClick={commitStaging}><Check size={14} /> Confirm & add {stagingIncludedCount}</button>
                 </div>
               </div>
-              <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 10px" }}>Every category below is auto-suggested from your merchant lookup table. Change any of them before confirming - nothing here touches your permanent log until you click Confirm.</p>
+              <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 10px" }}>Every category below is auto-suggested from your merchant lookup table. Change any of them before confirming - nothing here touches your permanent log until you click Confirm. Rows flagged as possible duplicates start unchecked; check one back in if it's actually new.</p>
               <div style={{ overflowX: "auto", maxHeight: "420px", overflowY: "auto" }}>
                 <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                  <thead><tr><th style={th}>Date</th><th style={th}>Merchant</th><th style={{ ...th, textAlign: "right" }}>Amount</th><th style={th}>Category</th><th style={th}></th></tr></thead>
+                  <thead><tr><th style={th}></th><th style={th}>Date</th><th style={th}>Merchant</th><th style={{ ...th, textAlign: "right" }}>Amount</th><th style={th}>Category</th><th style={th}></th></tr></thead>
                   <tbody>
                     {staging.map(r => (
-                      <tr key={r.stageId}>
+                      <tr key={r.stageId} style={r.isDuplicate ? { opacity: r.included ? 1 : 0.65 } : undefined}>
+                        <td style={td}><input type="checkbox" checked={!!r.included} onChange={() => toggleStagingIncluded(r.stageId)}
+                          aria-label={`Include ${r.merchant} in this import`} /></td>
                         <td style={{ ...td, ...num, color: "var(--text-secondary)" }}>{r.date}</td>
-                        <td style={{ ...td, ...num }}>{r.merchant}</td>
+                        <td style={{ ...td, ...num }}>
+                          {r.merchant}
+                          {r.isDuplicate && (
+                            <span style={{ display: "inline-block", marginLeft: "8px", fontSize: "10px", color: "var(--text-danger)", background: "var(--bg-danger)", border: "1px solid var(--border-danger)", padding: "2px 7px", borderRadius: "999px", whiteSpace: "nowrap" }}>
+                              Duplicate (already in log)
+                            </span>
+                          )}
+                        </td>
                         <td style={{ ...td, textAlign: "right", ...num }}>{r.amount < 0 ? "-" : "+"}${Math.abs(r.amount).toFixed(2)}</td>
                         <td style={td}>
                           <select value={r.category} onChange={e => updateStagingCategory(r.stageId, e.target.value)}
@@ -3834,8 +3934,17 @@ export default function Ledger() {
                 <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>to</span>
                 <input type="date" value={dateTo} onChange={e => { setDateTo(e.target.value); setQuickMonth(""); }} style={{ ...input, width: "140px" }} />
                 {(dateFrom || dateTo) && <button style={{ ...btn, padding: "4px 10px" }} onClick={() => { setDateFrom(""); setDateTo(""); setQuickMonth(""); }}>Clear dates</button>}
+                {transactions.length > 0 && (
+                  <button style={{ ...btn, padding: "4px 10px", color: "var(--text-danger)", borderColor: "var(--border-danger)" }}
+                    onClick={() => setShowDeleteAllModal(true)}>
+                    <Trash2 size={13} /> Delete all ({transactions.length})
+                  </button>
+                )}
               </div>
             </div>
+            {showDeleteAllModal && (
+              <DeleteAllConfirmModal count={transactions.length} onConfirm={deleteAllTransactions} onCancel={() => setShowDeleteAllModal(false)} />
+            )}
             {selectedTxnIds.size > 0 && (
               <div style={{ position: "sticky", top: 0, zIndex: 5, ...card, background: "var(--bg-accent)", borderColor: "var(--text-accent)", padding: "10px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px", flexWrap: "wrap", marginBottom: "10px" }}>
                 <span style={{ fontSize: "13px", fontWeight: 500, color: "var(--text-accent)" }}>{selectedTxnIds.size} selected</span>
@@ -4305,6 +4414,32 @@ function RegexRuleTester() {
   );
 }
 
+// "Clear Cache & Hard Reset" (Settings > Storage & Cache Management). Unregisters every service
+// worker this origin has registered and empties everything in the Cache Storage API - the two places
+// a stale PWA build can hide behind - then forces a reload so the browser has to fetch fresh files.
+// `location.reload(true)`'s boolean argument is a long-deprecated, now-ignored hint in every current
+// browser; the unregister+cache-clear above is what actually does the work here, the reload just
+// picks up whatever's left once that's done. Deliberately doesn't touch localStorage/STORAGE_KEY -
+// this is a "get the latest code" tool, not a "wipe my data" one (see deleteAllTransactions above /
+// "Delete all" in the Log tab, or Load backup, for that).
+async function clearCacheAndHardReset() {
+  const ok = confirm("This will unregister service workers, clear cached application files, and reload the latest version from GitHub Pages. (Your local data will be preserved unless you choose to wipe it separately.)");
+  if (!ok) return;
+  try {
+    if ("serviceWorker" in navigator) {
+      const registrations = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(registrations.map(r => r.unregister()));
+    }
+    if (typeof caches !== "undefined") {
+      const keys = await caches.keys();
+      await Promise.all(keys.map(k => caches.delete(k)));
+    }
+  } catch (err) {
+    console.warn("Ledger: couldn't fully clear the service worker/cache state before reloading - reloading anyway.", err);
+  }
+  window.location.reload(true);
+}
+
 function SettingsTab({
   spendingCategories, addCategory, renameCategory, removeCategory, lookup, allCategories, addLookupRule, updateLookupRuleCategory, removeLookupRule,
   recurringConfig, updateRecurringConfig, resetRecurringConfig,
@@ -4443,6 +4578,17 @@ function SettingsTab({
         onConnectDropbox={onConnectDropbox} onDisconnectDropbox={onDisconnectDropbox}
         onSyncNow={onSyncNowToCloud} onPullFromCloud={onPullFromCloud}
       />
+
+      <div style={card}>
+        <div style={{ ...label, marginBottom: "10px" }}>Storage & Cache Management</div>
+        <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 12px" }}>
+          If the app looks stuck on an old version - a stale PWA install, a service worker still
+          serving cached files - unregister it and pull the latest build. This does not touch your
+          saved transactions, categories, or merchant rules; use "Delete all" on the Log tab or Load
+          backup for that.
+        </p>
+        <button style={btn} onClick={clearCacheAndHardReset}>Clear Cache & Hard Reset</button>
+      </div>
     </div>
   );
 }
