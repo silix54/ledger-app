@@ -1,0 +1,435 @@
+# Ledger — Project Context
+
+Personal budget & income manager. Single-file React component (`Ledger.jsx`), currently at
+**v6.1**, all of "Phase 3" complete. This document is the onboarding brief for whichever agent
+picks up Phase 4, and doubles as the project's own history.
+
+---
+
+## 1. Project Overview & Tech Stack
+
+Ledger is a **strict serverless, frontend-only React SPA**. There is no backend, no API, no
+server-side database, and no user accounts — it is meant to run entirely in one person's browser,
+built with **Vite** as the dev/build tool.
+
+Stack:
+
+- **React** (function components + hooks only — `useState`, `useMemo`, `useRef`, `useEffect`).
+  No class components, no external state library (no Redux/Zustand/Context providers) — all state
+  lives in the top-level `Ledger` component and is threaded down via props.
+- **`localStorage`** is the database. All transactions, budget data, merchant rules, spending
+  categories, recurring-detection config, and dashboard layout preferences autosave to one JSON
+  blob under a single key. There is no IndexedDB, no server sync, no multi-device story — the data
+  lives in one browser profile unless the user exports/imports a JSON backup by hand.
+- **`papaparse`** parses pasted/uploaded CSV bank statements into staged transaction rows before
+  they're committed to the ledger.
+- **`recharts`** renders every chart on the Dashboard (line, area, pie, bar) — no other charting
+  library, no D3 direct usage.
+- **`lucide-react`** supplies every icon used in the UI.
+- **Theming** is done via CSS custom properties (`var(--surface-1)`, `var(--border)`, `var(--text-secondary)`,
+  etc.), defined in a `THEME_CSS` string constant and injected via a `<style>{THEME_CSS}</style>`
+  tag scoped under `.ledger-root[data-theme]`. Light/dark is a `data-theme` attribute on the root
+  element, toggled and persisted separately from the main autosave (see `PREF_KEY` below). This
+  keeps the component fully self-contained — no CSS files, no Tailwind, no build-time CSS
+  dependency — so it renders correctly whether embedded in an artifact host or a plain Vite app.
+- A second injected style block, `PRINT_CSS`, handles `@media print` styling for the "Export
+  Summary → Print/Save PDF" feature (see §2 and the v6.0/v6.1 history below).
+
+**Non-goals, on purpose:** no backend, no auth, no multi-user support, no cloud sync, no mobile
+app wrapper. If Phase 4 or later introduces any of these, it's a deliberate architecture change,
+not an oversight — flag it explicitly rather than assuming it fits the existing patterns below.
+
+---
+
+## 2. Core Architecture & Logic Constraints
+
+### The no-backend rule
+
+Every feature must be implementable as pure client-side JS + `localStorage`. There is no server to
+validate against, no network calls (aside from nothing — the app makes zero fetch/XHR calls in
+normal operation), and no async data source. All "persistence" is synchronous `JSON.stringify` /
+`JSON.parse` against `window.localStorage`. Any new feature should ask "does this need a backend?"
+— if yes, that's a Phase 4+ conversation to have explicitly with the user, not something to
+introduce quietly.
+
+### The `STORAGE_KEY` autosave pattern
+
+```js
+const STORAGE_KEY = "ledger:autosave:v1";
+```
+
+All persisted state lives under this **one** localStorage key, as a single JSON object, in the
+same shape used by manual JSON export/import (`exportData` / `importData`). Currently the payload
+shape is:
+
+```js
+{ transactions, lookup, spendingCategories, budget, recurringConfig, dashboardLayout }
+```
+
+Reading back in happens through `readPersistedStore()`, which:
+
+1. Runs once per page load and caches its result at module scope (`_persistedCache`), so the
+   several `useState(() => persisted.X || DEFAULT_X)` lazy initializers across the component don't
+   each independently re-parse the same JSON blob.
+2. Is wrapped end-to-end in `try/catch` — `localStorage` access itself can throw (private/blocked
+   browsing contexts), not just `JSON.parse` — so any failure anywhere in this function silently
+   falls back to empty/default state rather than crashing the app.
+3. Validates **every** section independently with a dedicated `isValidX` predicate before trusting
+   it (`isValidTransaction`, `isValidLookupEntry`, `isValidBudget`, `isValidRecurringConfig`,
+   `isValidDashboardLayout`). A malformed or missing section just falls back to its own default —
+   it never takes down the other sections.
+4. Runs the relevant migration function on every section that has one (`migrateWealthsimpleTransactions`,
+   `migrateWealthsimpleLookup`, `ensureWealthsimpleCategory`, `migrateBudget`, `normalizeDashboardLayout`)
+   so that old data shapes are transparently upgraded on load.
+
+A separate `useEffect` (the autosave effect) re-serializes and writes this same payload back to
+`STORAGE_KEY` on every relevant state change, debounced/guarded by a `suppressDirtyCheck` ref so
+that state updates made *by* an import don't immediately re-trigger a redundant "dirty" write.
+
+Theme preference (light/dark) is intentionally **not** part of this payload — it's stored under a
+separate `PREF_KEY`, since it's a per-browser display preference, not financial data, and shouldn't
+be bundled into JSON backups the user might share or restore across machines with different
+preferences.
+
+### `computeNextId` — safe ID generation under deletion
+
+```js
+function computeNextId(transactions) {
+  let max = -1;
+  for (const t of transactions) { if (Number.isFinite(t.id) && t.id > max) max = t.id; }
+  return max + 1;
+}
+```
+
+IDs are **never** derived from `array.length`. Once row deletion exists (transactions, committed
+costs, net worth items, income streams, target scenarios), `length` and `max id` diverge the
+moment something in the middle of the array is removed — deriving the next id from length would
+then hand out an id that already exists, silently colliding with a surviving row. `computeNextId`
+instead does a linear scan for the true maximum id and returns `max + 1`, which is correct
+regardless of gaps left by deletions. It's written as an explicit loop rather than
+`Math.max(...ids)` specifically so it can't blow the call stack on a large CSV import.
+
+This exact pattern is reused for every id-bearing list in the app: `nextId` (transactions),
+`nextCostId` (committed costs), `nextNetWorthId`, `nextIncomeStreamId`, `nextTargetId` (target
+scenarios). Any new list of user-addable/removable rows should follow the same pattern — a `useRef`
+initialized via `computeNextId(list)`, incremented on add, never reset on delete.
+
+### `migrateBudget` — safe forward migration of legacy data shapes
+
+The budget object has evolved several times (flat fields → dynamic lists) across versions. Rather
+than one big gated function, `migrateBudget` does **N independent, idempotent migrations**, one per
+field family, each only running if its *target* shape isn't already present:
+
+```js
+function migrateBudget(b) {
+  const { gym, carInsurance, mealPrep, subs, phone,
+          portfolio, osap, incoming, aafcMonthly, reserveLow, reserveHigh,
+          targetFloor, targetMid, targetStretch, ...migrated } = b;
+
+  if (Array.isArray(b.committedCosts)) { migrated.committedCosts = b.committedCosts; }
+  else { /* build committedCosts[] from gym/carInsurance/mealPrep/subs/phone */ }
+
+  if (Array.isArray(b.netWorthItems)) { migrated.netWorthItems = b.netWorthItems; }
+  else { /* build netWorthItems[] from portfolio/incoming/osap */ }
+
+  if (Array.isArray(b.incomeStreams)) { migrated.incomeStreams = b.incomeStreams; }
+  else { /* build incomeStreams[] from aafcMonthly/reserveLow/reserveHigh */ }
+
+  if (Array.isArray(b.targetScenarios)) { migrated.targetScenarios = b.targetScenarios; }
+  else { /* build targetScenarios[] from targetFloor/targetMid/targetStretch */ }
+
+  return migrated;
+}
+```
+
+Why independent blocks rather than one early-return gate: a real backup might be a hybrid — e.g. a
+v3 budget that already has `netWorthItems` (migrated once already) but is being re-loaded alongside
+a hand-edited `targetFloor` the user never got a chance to convert. Each block asks "do *I* already
+have my modern shape?" rather than "is the whole object modern?", so migration is safe to run
+unconditionally on **every** load (autosave and JSON import alike), on data from any historical
+version, and is a guaranteed no-op if run twice on already-current data.
+
+**This same pattern — small independent idempotent per-field migrations, run on both load paths —
+is the template for any future data-shape change.** The newer `normalizeDashboardLayout` (v6.1)
+follows the same spirit for a different problem shape (an ordered array rather than a flat object):
+it drops unknown/stale section ids, dedups (first occurrence wins), and backfills any known section
+missing from the saved array — so a dashboard layout saved by an older or newer version of the app
+always merges safely.
+
+### Other constraints worth preserving into Phase 4
+
+- **Strict-validate-then-apply-as-one-batch** for JSON import (`importData`): every section's shape
+  is validated *before any state setter runs at all*. This guarantees a backup file with one
+  malformed section can never partially overwrite good data in an unrelated section. Each section
+  is validated, then applied guarded by its own `hasX` boolean.
+- **"Excluded set" vs. "ordered array" filter patterns**: the Dashboard's category multi-select
+  filter tracks what's *excluded* (so newly-added categories are included by default with zero sync
+  logic needed); `dashboardLayout` tracks an *ordered array* of `{id, visible}` instead, because
+  order is meaningful there in a way it isn't for the category filter. Pick the pattern that matches
+  whether order matters.
+- **Popover/dropdown UI pattern** (reused 3×: `CategoryFilterMenu`, `ExportSummaryMenu`,
+  `DashboardLayoutMenu`): `useState(open)` + `useRef(boxRef)` + a `useEffect` registering a
+  `document.addEventListener("mousedown", onDocClick)` that closes the popover on outside click.
+  Reuse this rather than inventing a new popover mechanism.
+- **`confirm()` for consequential actions**: category removal, transaction deletion, and the bulk
+  "update merchant lookup rules?" prompt all use the native `window.confirm()` dialog rather than a
+  custom modal — this has been a deliberate simplicity choice throughout, not an oversight.
+- **Print stylesheet**: `.ledger-no-print` is reserved *only* for genuine app chrome (header, tab
+  nav, storage-warning banner, the filter-bar/customize-layout/export controls row) that should
+  never print regardless of dashboard layout settings. As of v6.1, which Dashboard *sections* print
+  is governed entirely by `dashboardLayout`'s `visible` flags, since a hidden section isn't just
+  CSS-hidden — it's not rendered into the DOM at all, so it's automatically excluded from print too.
+  Don't reintroduce a parallel hardcoded print-exclusion list for dashboard sections.
+
+---
+
+## 3. Data Schema
+
+All of the shapes below are validated by an `isValidX` predicate in the source and, where
+applicable, upgraded by a migration function on every load. Field names are exact.
+
+### Transaction
+
+```js
+{
+  id: number,          // via computeNextId — unique, never reused, gaps OK after deletion
+  date: string,         // "YYYY-MM-DD", validated by isValidDateString
+  description: string,  // raw statement text (may be blank if merchant is present)
+  merchant: string,     // cleaned/short merchant name (may be blank if description is present)
+  amount: number,       // signed: negative = spend, positive = income/credit
+  category: string | null,  // null = uncategorized ("Pending review" / "REVIEW: Ambiguous")
+  splitParentId?: number,   // present only on a "split child" row — see Transaction Splitting below
+}
+```
+
+Validated by `isValidTransaction`: requires a valid date, *either* `merchant` or `description` as a
+string, a finite `amount`, and `category` that's either `null`/`undefined` or a string.
+`splitParentId` is optional/additive — old data simply won't have it.
+
+#### Transaction Splitting (v6.2+)
+
+Splitting a transaction (Log tab, "Split" button) divides its amount across two or more categories.
+There is no separate "split line item" shape — a split **replaces** the one original row with N
+ordinary transaction rows (same `date`/`merchant`/`description`, one `category` and partial `amount`
+each), each tagged with `splitParentId` set to the original transaction's `id`. That id is retired
+(the original row is removed) but never reused, since `nextId`/`computeNextId` only ever hand out
+values larger than any id seen so far — so `splitParentId` stays a stable, collision-free way to find
+every sibling later, even though no row with that `id` still exists. `mergeSplitGroup` un-splits by
+collecting every row sharing a `splitParentId`, summing their amounts back into one row (category
+reset to `null`, since the point of a split was dividing across more than one), and dropping the old
+`splitParentId` link. The save path enforces — both in the row editor and again at the point of
+actually writing state — that every part has a category and the parts sum to *exactly* the original
+amount, compared in whole cents rather than as floats to avoid binary rounding false negatives.
+
+Deliberately **not** modeled as one parent row plus attached split-lines: every dashboard chart,
+filter, and total already sums plain transactions by category/date/amount, so expanding a split into
+ordinary rows means none of that aggregation code needs to know splits exist — a split row is just a
+transaction, and every total, chart, filter, and CSV/print export is correct by construction with zero
+split-specific logic. The one known soft edge: `detectRecurring` groups by merchant, so several same-
+day split children of one recurring charge add same-day/zero-gap entries into that merchant's interval
+average — a pre-existing consequence of grouping by merchant alone, not something splitting uniquely
+breaks (two genuinely separate same-day purchases at one merchant would do the same).
+
+Categories are one of:
+- A **system category** (`SYSTEM_CATEGORIES` — fixed, not user-editable, drives core math):
+  `"TRANSFER: Credit Card Payment"`, `"TRANSFER: Internal/Other"`, `"INCOME: Employment"`,
+  `"INCOME: Benefits"`, `"INCOME: Reimbursement"`, `"INCOME: Resale"`, `"EXCLUDE: Failed Transfer"`,
+  `"REVIEW: Ambiguous"`.
+- A **user-editable spending category** — see `spendingCategories` below. As of v4.1, `"Investing"`
+  is a normal spending category (formerly the system category `"TRANSFER: Wealthsimple"`, migrated
+  forward by `migrateWealthsimpleTransactions`/`migrateWealthsimpleLookup`/`ensureWealthsimpleCategory`).
+
+### Merchant Lookup
+
+```js
+lookup: Array<[matchKey: string, category: string]>
+```
+
+An array of 2-tuples, not a plain object — order matters. `sortLookup()` keeps entries sorted by
+**descending key length**, so a more specific rule (e.g. `"amazon.ca prime"`) always wins over a
+shorter, more general one (`"amazon.ca"`) without the user having to manually reorder rules.
+Validated per-entry by `isValidLookupEntry` (`Array.isArray(e) && e.length === 2 &&` both elements
+strings). New/corrected rules are **upserted** (a re-correction replaces the prior entry for the
+same normalized key), never duplicated.
+
+### Spending Categories
+
+```js
+spendingCategories: string[]
+```
+
+Freely user-editable list of spending category names (add/rename/remove from Settings). Seeded by
+default from `DEFAULT_SPENDING_CATEGORIES`. `ensureWealthsimpleCategory` guarantees `"Investing"` is
+always present after migration.
+
+### Budget object
+
+```js
+budget: {
+  tithe: number,              // fraction, e.g. 0.10
+  discretionary: number,
+  monthsRemaining: number,
+  committedCosts: Array<{ id: number, label: string, amount: number }>,
+  netWorthItems: Array<{ id: number, label: string, amount: number, type: "asset" | "liability" }>,
+  incomeStreams: Array<{ id: number, label: string, low: number, high: number }>,
+  targetScenarios: Array<{ id: number, label: string, amount: number }>,
+}
+```
+
+- `committedCosts` — recurring fixed expenses (gym, phone, subscriptions, etc.), dynamic
+  add/rename/edit/delete list. Legacy flat fields folded in: `gym`, `carInsurance`, `mealPrep`,
+  `subs`, `phone`.
+- `netWorthItems` — each tagged `"asset"` or `"liability"`, so net position is computed generically
+  (sum of assets minus sum of liabilities) rather than via hardcoded field names. Legacy flat fields
+  folded in: `portfolio`, `incoming` (both assets), `osap` (liability).
+- `incomeStreams` — each carries a `low`/`high` monthly range rather than a single number, so a
+  guaranteed fixed source (`low === high`) and a variable source (e.g. reservist pay) share one
+  shape. Legacy flat fields folded in: `aafcMonthly`, `reserveLow`, `reserveHigh`.
+- `targetScenarios` — dynamic replacement (v5.0+) for the old fixed Floor/Mid/Stretch trio. Legacy
+  flat fields folded in: `targetFloor`, `targetMid`, `targetStretch`.
+
+Validated by `isValidBudget`: numeric top-level keys checked against `BUDGET_NUMERIC_KEYS`, each
+array field checked (if present) against its item-level `isValidX` predicate.
+
+### Recurring-Detection Config (v6.0+)
+
+```js
+recurringConfig: {
+  minOccurrences: number,   // default 3
+  biweeklyMin: number,      // default 10 (days)
+  biweeklyMax: number,      // default 18
+  monthlyMin: number,       // default 19
+  monthlyMax: number,       // default 35
+}
+```
+
+Merged over `DEFAULT_RECURRING_CONFIG` at use time; `biweekly`/`monthly` are checked as two fully
+independent windows (not one merged range split by a midpoint), so narrowing one window never
+silently affects the other.
+
+### Dashboard Layout (v6.1+)
+
+```js
+dashboardLayout: Array<{ id: string, visible: boolean }>
+```
+
+One entry per known dashboard section id, in display order. Known ids (`DASHBOARD_SECTION_IDS`):
+`summaryCards`, `trendLine`, `cumulativeNet`, `spendSharePie`, `incomeBar`, `categoryBar`,
+`recurringBills`. `normalizeDashboardLayout` drops unknown/stale ids, dedups (first wins), and
+appends any known section missing from the saved array as visible — so old, new, or hand-edited
+layout arrays always merge safely to exactly the 7 known sections.
+
+### Staging rows (transient, not persisted)
+
+CSV/paste import produces `staging` rows (not part of the persisted payload) shaped like a
+transaction plus a `suggested` category field (from lookup match) and the user's chosen `category`;
+`commitStaging()` converts each into a real transaction (assigning a fresh `id` via `nextId`) and
+upserts any manual correction into `lookup`.
+
+---
+
+## 4. Version Archive Index
+
+All `.jsx` files below are kept in `_archive/`. This is the exact feature/fix history — use it to
+pick which file to restore from if a rollback is ever needed.
+
+- **v1 — Initial ledger.** CSV import, merchant lookup matching, manual categorization, basic
+  transaction table. Foundational shape of `transactions`/`lookup`/`spendingCategories`.
+
+- **v2 — Committed costs.** Introduced the fixed monthly expenses concept as flat budget fields
+  (`gym`, `carInsurance`, `mealPrep`, `subs`, `phone`) — later generalized into `committedCosts[]`
+  in v3, with `migrateBudget` folding these flat fields forward ever since.
+
+- **v3.0 — Budget Generalization.** Converted fixed net-worth fields (`portfolio`/`osap`/`incoming`)
+  into a dynamic `netWorthItems[]` list (asset/liability typed), and fixed income fields
+  (`aafcMonthly`/`reserveLow`/`reserveHigh`) into a dynamic `incomeStreams[]` list (low/high range).
+  Added actual-vs-plan tracking. Also generalized `committedCosts` into its final dynamic
+  add/rename/edit/delete list form. This is where `computeNextId` and the "small independent
+  migration blocks" pattern in `migrateBudget` were established.
+
+- **v4.0 — Dashboard Customization & Theme.** Added the Dashboard tab's period/category filter bar,
+  chart drill-down (click a Pie/Bar segment to jump to the filtered Log), light/dark theme via
+  `THEME_CSS` + `data-theme`, and general UI polish.
+
+- **v4.1 — Wealthsimple Investment Expense Visualization.** Reclassified the system category
+  `"TRANSFER: Wealthsimple"` (previously hidden from spend entirely) into a normal, user-editable
+  spending category, `"Investing"` — investing now shows up in total spend, the category breakdown,
+  and every relevant chart. Added the three-part migration
+  (`migrateWealthsimpleTransactions`/`migrateWealthsimpleLookup`/`ensureWealthsimpleCategory`) that
+  runs on every load path, forward-converting any historical data still using the old category.
+
+- **v5.0 — "Phase 2 Final" (Row Edit/Delete, Undo Import, Dynamic Targets).**
+  - Row-level **Edit/Delete** on the Log tab (inline edit of date/merchant/amount/category; delete
+    requires `confirm()`; both correctly interoperate with `computeNextId`).
+  - **Undo Last Import**: `commitStaging` now tracks the exact batch of ids it just committed
+    (`lastImportBatch`); a dismissible banner offers one-click rollback of *only* that batch, never
+    a wider "delete everything" action.
+  - **Dynamic Target Scenarios**: generalized the fixed Floor/Mid/Stretch trio into a dynamic
+    `targetScenarios[]` list, following the exact `committedCosts`/`netWorthItems`/`incomeStreams`
+    pattern, with legacy `targetFloor`/`targetMid`/`targetStretch` migrated forward losslessly.
+
+- **v6.0 — "Phase 3" (Bulk Recategorization, Reports & Tuning).**
+  - **Bulk Re-categorization**: row selection checkboxes + "Select All Visible" on the Log tab; a
+    sticky bulk action bar (category selector, Apply, Deselect All) appears once ≥1 row is
+    selected; if the selected batch includes a merchant appearing more than once, prompts
+    (`confirm()`) to also upsert a matching lookup rule.
+  - **Report Exports**: "Export Summary" menu on the Dashboard offering CSV download (category
+    breakdown with monthly totals/percentages) and Print/Save PDF (`window.print()` with the new
+    `PRINT_CSS` print stylesheet).
+  - **Recurring-Detection Tuning**: new Settings section exposing `recurringConfig`
+    (`minOccurrences`, `biweeklyMin/Max`, `monthlyMin/Max`) as editable, persisted, resettable
+    inputs; `detectRecurring` refactored to accept this config and check biweekly/monthly as two
+    independent windows.
+
+- **v6.1 — "Final Phase 3" (Dashboard Layout Controls).**
+  - **Dashboard Section Visibility & Reordering**: "Customize Layout" popover (button next to
+    "Export Summary") listing all 7 dashboard sections with visibility checkboxes, Move Up/Down
+    reordering, and "Reset to Default Layout." Persisted as `dashboardLayout` inside the same
+    autosave payload, merged safely via `normalizeDashboardLayout` (drops unknown ids, dedups,
+    backfills missing known sections) and included in JSON export/import.
+  - **Print Styles Compatibility**: because a hidden section is now genuinely absent from the DOM
+    (not just CSS-hidden), Print/PDF automatically respects both the custom order and hidden state
+    with no additional print-specific logic — `.ledger-no-print` was narrowed to cover only real
+    app chrome.
+  - **Notable visual side effect**: "Spend Share Pie Chart" and "Income by Source Bar Chart" were
+    split from v6.0's 2-column side-by-side grid into two independent full-width stacked sections,
+    since v6.1 requires every section to be independently reorderable.
+
+- **v6.2 — "Phase 4 Item 1" (Transaction Splitting).** *Current production version.*
+  - **Split a transaction across categories**: new "Split" button (Log tab actions column, next to
+    Edit/Delete) opens an inline row editor to divide one transaction's amount across two or more
+    categories. Save is blocked until every part has a category and the parts sum to *exactly* the
+    original amount (compared in whole cents, not floats).
+  - **Data model**: a split replaces the one original row with N ordinary transaction rows tagged
+    `splitParentId` (the retired original id) — no separate "split line" shape. See §3's Transaction
+    Splitting subsection for why, and for the un-split/merge path (`mergeSplitGroup`).
+  - **Dashboard/export integrity by construction**: because split rows are just transactions, every
+    existing chart, filter, total, and CSV/print export handles them with zero split-aware logic
+    added anywhere — this follows from the data model rather than needing per-chart changes. Checked
+    by build + lint only so far, not yet exercised against real data in a running browser.
+  - Also, incidentally: `src/Ledger.jsx` and the `papaparse`/`recharts`/`lucide-react` dependencies
+    it needs weren't actually wired into this Vite scaffold yet when this phase started (`App.jsx`
+    still rendered the default Vite demo) — fixed as a prerequisite so `npm run build` meaningfully
+    exercises this file.
+
+---
+
+## 5. Current State
+
+The current master component is **`src/Ledger.jsx`** — version comment
+`// Version: 6.2 - Phase 4 Item 1 (Transaction Splitting)`, component export
+`export default function Ledger()`, rendered from `src/App.jsx`. The prior v6.1 snapshot ("Final
+Phase 3," all Phase 3 roadmap items complete and verified — unit tests for every migration/validation
+function, a full regression suite across prior versions' features, and a live-browser Playwright
+smoke test with screenshots) is kept at `_archive/Ledger_v6_1.jsx`.
+
+Phase 4 Item 1 (Transaction Splitting, v6.2) has been implemented and checked with `npm run build`
+and `npm run lint` only — it has **not** yet had unit tests written for the new
+`splitTransaction`/`mergeSplitGroup` logic, nor a live-browser regression pass. Both are still
+outstanding before this item should be considered verified to the same bar as Phase 3.
+
+Everything above — the no-backend constraint, the `STORAGE_KEY` autosave shape, `computeNextId`,
+the independent-idempotent-migration pattern, and the exact data schemas in §3 — should be treated
+as load-bearing for Phase 4 unless the user explicitly asks to change the architecture (e.g.
+introducing a real backend, multi-device sync, or a different persistence layer would be a
+deliberate, discussed departure from everything this file describes, not a default to drift into).
