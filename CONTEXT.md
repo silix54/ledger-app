@@ -36,9 +36,27 @@ Stack:
 - A second injected style block, `PRINT_CSS`, handles `@media print` styling for the "Export
   Summary → Print/Save PDF" feature (see §2 and the v6.0/v6.1 history below).
 
-**Non-goals, on purpose:** no backend, no auth, no multi-user support, no cloud sync, no mobile
-app wrapper. If Phase 4 or later introduces any of these, it's a deliberate architecture change,
-not an oversight — flag it explicitly rather than assuming it fits the existing patterns below.
+**Non-goals, on purpose:** no backend, no auth, no multi-user support, no mobile app wrapper. If
+Phase 4 or later introduces any of these, it's a deliberate architecture change, not an oversight —
+flag it explicitly rather than assuming it fits the existing patterns below.
+
+**Update, v6.5:** "no cloud sync" was on this list through v6.4. Phase 4 Item 4 deliberately lifts
+it — Cloud Sync (Settings tab) syncs an encrypted copy of the full `STORAGE_KEY` payload to the
+person's own Google Drive AppData folder. This was a discussed, explicit departure, not drift, and
+it's still consistent with every other non-goal above: there's still no backend this project runs
+or controls (every request goes straight from the browser to Google's own OAuth/Drive APIs — see
+§3's Cloud Sync Payload subsection), still no auth for *this app* (Google's own OAuth login is the
+only identity involved, and it gates nothing but this one feature), and it's opt-in — a person who
+never enters a Google Client ID never triggers a network call, and every other feature keeps working
+exactly as before, entirely offline, with or without it configured.
+
+**Update, v6.6:** Cloud Sync is now dual-provider — a provider toggle (Google Drive / Dropbox) inside
+the same Settings > Cloud Sync panel. Everything the v6.5 note above says still holds per-provider:
+Dropbox calls go straight from the browser to Dropbox's own OAuth/REST APIs, no backend of this
+project's own is involved, and it's equally opt-in (a person who never enters a Dropbox App Key never
+triggers a Dropbox network call, independent of whether Google Drive is configured). The two
+providers share one encryption engine and one plaintext payload shape — see §3's Cloud Sync Payload
+subsection, now split into a shared part and a per-provider transport part.
 
 ---
 
@@ -395,6 +413,92 @@ transaction plus a `suggested` category field (from lookup match) and the user's
 `commitStaging()` converts each into a real transaction (assigning a fresh `id` via `nextId`) and
 upserts any manual correction into `lookup`.
 
+### Cloud Sync (v6.5+; dual-provider v6.6+)
+
+Optional, off by default. A provider toggle (`cloudProvider`, `"google" | "dropbox"`) picks which
+destination Sync Now / Pull from Cloud target; both share one encryption engine and one plaintext
+payload shape (below), and differ only in transport — how the encrypted envelope gets moved.
+
+**Persisted config** — small, deliberately **separate** localStorage keys per provider, same pattern
+as `THEME_KEY`: none of this is part of `STORAGE_KEY` or JSON export/import, since none of it is
+financial data.
+
+```js
+"ledger:cloudsync:provider:v1"                // string — "google" | "dropbox", which tab is showing
+"ledger:cloudsync:clientid:v1"                // string — the person's own Google OAuth Client ID
+"ledger:cloudsync:lastsynced:v1"              // string — ISO timestamp of the last successful Google sync/pull
+"ledger:cloudsync:dropbox:appkey:v1"          // string — the person's own Dropbox App Key
+"ledger:cloudsync:dropbox:refreshtoken:v1"    // string — Dropbox OAuth refresh token (see below)
+"ledger:cloudsync:dropbox:lastsynced:v1"      // string — ISO timestamp of the last successful Dropbox sync/pull
+```
+
+The encryption passphrase (`cloudPassphrase`) is **always memory-only** for both providers —
+reconnecting/re-entering it each session is the deliberate cost of a genuine zero-knowledge design,
+not an oversight to fix later. The two providers' *auth* credentials differ in persistence, though,
+for a structural reason rather than an inconsistency: Google's access token (`cloudAccessToken`,
+`{ token, expiresAt }`) is memory-only because Google Identity Services can silently re-mint it
+in-page once the scope is granted, with no navigation required — so there's nothing worth persisting.
+Dropbox's PKCE flow has no equivalent in-page mechanism; it's a genuine full-page redirect to
+dropbox.com and back (see `startDropboxAuth`/the redirect-handling `useEffect` in `Ledger()`), so
+without persisting *something*, every single sync after the first would force another full-page
+round trip. The Dropbox **refresh token** is persisted for exactly this reason — the Dropbox access
+token itself is still memory-only and short-lived, minted from the refresh token on demand
+(`getDropboxAccessToken`) with no redirect needed. Disconnect clears the persisted refresh token
+(the part that actually matters for "can this browser still authenticate") and best-effort revokes it
+with Dropbox if a live access token happens to be in memory.
+
+**What actually gets uploaded** — one file, `ledger-vault.enc`, whose location is provider-specific:
+strictly inside the hidden Google Drive `appDataFolder` (invisible in the person's normal Drive UI,
+and the only place the `drive.appdata`-scoped OAuth token can even see), or at `/ledger-vault.enc`
+inside the Dropbox app's own app folder (invisible in the person's normal Dropbox UI — enforced by
+that Dropbox app being registered with "App folder" access in the Dropbox App Console, a one-time
+setup step on Dropbox's side this code can't itself enforce, the same way the Google Cloud OAuth
+client is the person's own one-time setup). Either way the file's content is one JSON envelope, not
+the raw ledger JSON:
+
+```js
+{
+  v: 1,                        // envelope format version
+  kdf: "PBKDF2-SHA256",
+  iterations: number,          // 100000 — travels with the file so a future iteration-count bump
+                                // can still decrypt an older backup
+  salt: string,                 // base64, 16 random bytes, fresh every encryption
+  iv: string,                   // base64, 12 random bytes, fresh every encryption
+  ciphertext: string,            // base64 AES-GCM ciphertext
+}
+```
+
+The plaintext AES-GCM encrypts, before it's ever touched by `fetch`, is exactly the same shape
+`exportData`/`importData` already use — `{ transactions, lookup, spendingCategories, budget,
+recurringConfig, dashboardLayout, exportedAt }` — so Pull from Cloud can reuse `importData`'s exact
+per-section `isValidX` validators and "validate everything, then apply as one atomic batch" rule
+(see §2's "Strict-validate-then-apply-as-one-batch" note), unchanged and unduplicated regardless of
+which provider the envelope came from. A wrong passphrase or a corrupted file fails at the AES-GCM
+decrypt step itself (an authentication-tag mismatch), caught and alerted safely *before* any
+validation or state update runs — local data is provably untouched either way, matching this app's
+general "safe fallback over silent corruption" posture everywhere else.
+
+Key derivation is PBKDF2 (SHA-256, 100,000 iterations) straight off `window.crypto.subtle` — no third-
+party crypto library. `salt` and `iv` are regenerated on every single encryption (every Sync Now), so
+two uploads under the same passphrase never share key material. There is deliberately no passphrase
+recovery mechanism anywhere in this design: losing it means the cloud backup is permanently
+undecryptable, by anyone, including either provider.
+
+**Dropbox transport specifics (v6.6):** OAuth 2.0 with PKCE (`generatePkceVerifier`/
+`sha256Base64Url`/`startDropboxAuth`), scope `files.content.write files.content.read`,
+`token_access_type=offline` to receive the refresh token discussed above. The PKCE `code_verifier`
+and anti-CSRF `state` are held in **`sessionStorage`** (not `localStorage`) under
+`ledger:cloudsync:dropbox:verifier`/`ledger:cloudsync:dropbox:state` — they only need to survive the
+single redirect round-trip in the same tab, and are deleted the instant that round-trip completes
+(success or failure). Upload/download use `mode: "overwrite"` against the stable path
+`/ledger-vault.enc` (`dropboxUploadVault`/`dropboxDownloadVault`) rather than Drive's find-by-name-
+then-create-or-patch-by-id dance, since Dropbox paths are already stable names. A missing vault file
+downloads as Dropbox's own 409 "not found" response, handled identically to Drive's "no file found
+yet" case. Because connecting to Dropbox reloads the whole page, `connectDropbox` warns (`confirm()`)
+before starting the redirect if there are uncommitted staged import rows (`staging`, transient and
+never persisted — see the Staging rows subsection above), since a redirect would otherwise silently
+lose them.
+
 ---
 
 ## 4. Version Archive Index
@@ -503,7 +607,7 @@ pick which file to restore from if a rollback is ever needed.
   - Checked by build + lint only so far, same caveat as v6.2 — not yet exercised against real data in
     a running browser, and no unit tests written yet for `parseRegexRule`/`categorize`'s regex branch.
 
-- **v6.4 — "Phase 4 Item 3" (Predictive Forecasting & Runway Analytics).** *Current production version.*
+- **v6.4 — "Phase 4 Item 3" (Predictive Forecasting & Runway Analytics).**
   - **Goal Runway & Projections**: new Budget-tab section computing the historical 3-month and
     6-month average net monthly surplus (income − spend, from `monthlyTrend`'s full transaction
     history) and projecting it forward from the current net position (`netPos`, from
@@ -524,26 +628,120 @@ pick which file to restore from if a rollback is ever needed.
   - Checked by build + lint only so far, same caveat as v6.2/v6.3 — not yet exercised against real
     data in a running browser, and no unit tests written yet for `estimateMilestone`.
 
+- **v6.5 — "Phase 4 Item 4" (Serverless Cloud Sync — Google Drive AppData).**
+  - **Deliberate departure from "no cloud sync"**: the one explicitly-discussed exception to the
+    non-goals list in §1 — see the "Update, v6.5" note there for why this still respects the
+    no-backend rule (pure client-to-Google OAuth, nothing this project runs or controls).
+  - **New Cloud Sync panel, Settings tab**: a Google Client ID field (persisted to its own
+    localStorage key, never hardcoded — see §3's Cloud Sync subsection), an encryption passphrase
+    field (deliberately never persisted anywhere), Connect/Disconnect, Sync Now (upload/overwrite),
+    Pull from Cloud (download/restore), a live status line (Idle/Encrypting/Syncing/Error/Success),
+    and a last-synced timestamp.
+  - **Auth**: Google Identity Services' token client
+    (`google.accounts.oauth2.initTokenClient`/`requestAccessToken`), scoped to
+    `drive.appdata` only — this app can never see, list, or touch anything in the person's visible
+    Drive. The GIS script (`accounts.google.com/gsi/client`) loads on demand, only once Cloud Sync is
+    actually used, not eagerly on app load. The access token lives in memory only; the passphrase and
+    token are both cleared on Disconnect (which also best-effort revokes the OAuth grant).
+  - **Zero-knowledge encryption**: `window.crypto.subtle`, PBKDF2 (SHA-256, 100,000 iterations) to
+    derive an AES-GCM 256-bit key from the passphrase, fresh random salt + IV every encryption. The
+    plaintext is the exact same payload shape `exportData`/`importData` already use. See §3's Cloud
+    Sync subsection for the full envelope shape uploaded to Drive.
+  - **Drive operations**: `ledger-vault.enc` is queried/created/overwritten strictly inside the
+    hidden `appDataFolder` via Drive REST v3 (`driveFindVaultFileId`/`driveUploadVault`/
+    `driveDownloadVault`) — multipart create if it doesn't exist yet, a plain media `PATCH` to
+    overwrite it if it does.
+  - **Safety**: Pull from Cloud reuses the exact same per-section `isValidX` validators and
+    "validate everything before applying anything" rule `importData` already follows for a JSON
+    backup file (§2) — a malformed or wrong-passphrase cloud payload can no more partially corrupt
+    local data than a bad backup file can. A decrypt failure (wrong passphrase, or a
+    corrupted/foreign file) is caught on its own, *before* any validation runs, and alerted with a
+    generic message rather than surfacing the raw crypto error — local data is untouched either way.
+  - Checked by build + lint only so far, same caveat as every Phase 4 item before it — not yet
+    exercised against a real Google Cloud OAuth client/Drive account in a running browser, and no
+    unit tests written yet for the encrypt/decrypt round-trip or the Drive REST helpers.
+
+- **v6.6 — "Phase 4 Item 4 follow-up" (Dual-Provider Cloud Sync — Google Drive + Dropbox).** *Current
+  production version.*
+  - **Provider toggle**: the Cloud Sync panel gained a Google Drive / Dropbox tab switcher
+    (`cloudProvider`, persisted). Sync Now and Pull from Cloud are unchanged as one shared pair of
+    buttons — `syncNowToCloud`/`pullFromCloud` in `Ledger()` branch internally on `cloudProvider`
+    rather than the UI needing two parallel sets of actions. See the "Update, v6.6" note in §1 and
+    the rewritten §3 Cloud Sync subsection for the full persisted-key list and the shared-vs-per-
+    provider breakdown.
+  - **Dropbox auth**: OAuth 2.0 with PKCE, the standard flow for a public client with no backend to
+    hold a secret (`generatePkceVerifier`/`sha256Base64Url`/`startDropboxAuth`), requesting
+    `files.content.write files.content.read` scope. Unlike Google Identity Services, Dropbox's flow
+    is a genuine full-page redirect to dropbox.com and back — handled by a mount-time `useEffect` in
+    `Ledger()` that recognizes `?code=&state=` on load, exchanges the code (`exchangeDropboxCode`),
+    and scrubs the URL via `history.replaceState` so a refresh can't replay the one-time code. The
+    PKCE verifier and anti-CSRF state live in `sessionStorage` only, for the duration of that one
+    round trip.
+  - **Persisted Dropbox refresh token — a deliberate, documented asymmetry from Google**: because
+    Dropbox's redirect flow has no in-page silent-reauth equivalent to GIS, the refresh token is
+    persisted to localStorage (`DROPBOX_REFRESH_TOKEN_KEY`) so later syncs mint fresh short-lived
+    access tokens (`getDropboxAccessToken`/`refreshDropboxAccessToken`) without another full-page
+    redirect. Disconnect clears it and best-effort revokes it with Dropbox. See §3 for the full
+    reasoning.
+  - **Same shared encryption engine, same shared payload shape**: `encryptVaultPayload`/
+    `decryptVaultPayload` and the `{ transactions, lookup, spendingCategories, budget,
+    recurringConfig, dashboardLayout, exportedAt }` plaintext shape are untouched and unduplicated —
+    only the transport (auth + REST calls) differs per provider. Pull from Cloud's validate-then-
+    apply-as-one-batch logic (§2, §3) is likewise shared, not forked per provider.
+  - **Dropbox operations**: `ledger-vault.enc` is uploaded/downloaded at the stable path
+    `/ledger-vault.enc` inside the Dropbox app's own app folder (`dropboxUploadVault` with
+    `mode: "overwrite"` / `dropboxDownloadVault`, treating Dropbox's 409 "not found" response the
+    same as Drive's "no file yet" case) — simpler than Drive's find-by-name-then-create-or-patch-by-
+    id dance, since Dropbox paths are already stable names.
+  - **Safety**: `connectDropbox` warns (`confirm()`) before starting the redirect if there are
+    uncommitted staged import rows, since a full-page redirect would otherwise silently lose them
+    (staging is transient and never persisted — see §3's Staging rows subsection). Every other safety
+    property from v6.5 (validate-before-apply, safe decrypt-failure handling) is provider-agnostic
+    and applies identically to a Dropbox-sourced payload.
+  - Checked by build + lint only so far, same caveat as every Phase 4 item before it — not yet
+    exercised against a real Dropbox App Console app/account in a running browser (the redirect round
+    trip in particular has only been read-reviewed against Dropbox's documented OAuth/PKCE and Files
+    API shapes, not run live), and no unit tests written yet for the PKCE helpers or the Dropbox REST
+    helpers.
+
 ---
 
 ## 5. Current State
 
 The current master component is **`src/Ledger.jsx`** — version comment
-`// Version: 6.4 - Phase 4 Item 3 (Predictive Forecasting & Runway Analytics)`, component export
-`export default function Ledger()`, rendered from `src/App.jsx`. The prior v6.1 snapshot ("Final
-Phase 3," all Phase 3 roadmap items complete and verified — unit tests for every migration/validation
-function, a full regression suite across prior versions' features, and a live-browser Playwright
-smoke test with screenshots) is kept at `_archive/Ledger_v6_1.jsx`.
+`// Version: 6.6 - Phase 4 Item 4 follow-up (Dual-Provider Cloud Sync - Google Drive + Dropbox)`,
+component export `export default function Ledger()`, rendered from `src/App.jsx`. The prior v6.1
+snapshot ("Final Phase 3," all Phase 3 roadmap items complete and verified — unit tests for every
+migration/validation function, a full regression suite across prior versions' features, and a
+live-browser Playwright smoke test with screenshots) is kept at `_archive/Ledger_v6_1.jsx`.
 
-Phase 4 Items 1 through 3 (Transaction Splitting v6.2, Advanced Regex Rules Engine v6.3, Predictive
-Forecasting & Runway Analytics v6.4) have been implemented and checked with `npm run build` and
+Phase 4 Items 1 through 4, the latter now spanning two versions (Transaction Splitting v6.2, Advanced
+Regex Rules Engine v6.3, Predictive Forecasting & Runway Analytics v6.4, Serverless Cloud Sync v6.5,
+Dual-Provider Cloud Sync v6.6) have been implemented and checked with `npm run build` and
 `npm run lint` only — none has had unit tests written yet (for `splitTransaction`/`mergeSplitGroup`;
-`parseRegexRule`/`categorize`'s regex branch; or `estimateMilestone`), nor a live-browser regression
-pass. All are still outstanding before this phase should be considered verified to the same bar as
-Phase 3.
+`parseRegexRule`/`categorize`'s regex branch; `estimateMilestone`; v6.5's
+`encryptVaultPayload`/`decryptVaultPayload`/Drive REST helpers; or v6.6's PKCE/Dropbox REST helpers),
+nor a live-browser regression pass. All are still outstanding before this phase should be considered
+verified to the same bar as Phase 3. v6.5 and v6.6 in particular have never been run against a real
+Google Cloud OAuth client/Drive account or a real Dropbox App Console app/account — only build- and
+lint-checked, and read-reviewed against each provider's documented API shapes.
+
+**Pre-existing `npm run lint` errors, unrelated to Phase 4:** `npm run lint` on the codebase as
+received at the start of Phase 4 Item 4 already reported 9 errors having nothing to do with cloud
+sync — an unused `Settings` icon import, two `no-useless-assignment` warnings inside `migrateBudget`,
+two unused `err` catch-clause bindings (theme init, autosave), and four React Compiler
+`react-hooks` findings (`set-state-in-effect` ×3, `immutability` ×1) in pre-existing effects/memos.
+Both v6.5 and v6.6 were written to introduce **zero new** lint errors or warnings on top of that
+baseline (verified by diffing `npm run lint` before/after each) rather than silently accumulating
+more debt, but none of those 9 pre-existing ones were touched or fixed here since they're out of
+scope for this feature — flagging them explicitly so a future pass doesn't mistake "9 errors" for
+something Phase 4 Item 4 introduced.
 
 Everything above — the no-backend constraint, the `STORAGE_KEY` autosave shape, `computeNextId`,
 the independent-idempotent-migration pattern, and the exact data schemas in §3 — should be treated
-as load-bearing for Phase 4 unless the user explicitly asks to change the architecture (e.g.
-introducing a real backend, multi-device sync, or a different persistence layer would be a
-deliberate, discussed departure from everything this file describes, not a default to drift into).
+as load-bearing for Phase 4 unless the user explicitly asks to change the architecture. Cloud Sync
+(v6.5, extended to a second provider in v6.6) is exactly one such explicitly-discussed departure (see
+§1's "Update, v6.5"/"Update, v6.6" notes) — it does not license quietly extending the app toward a
+real backend, multi-device sync of any other kind, a third sync provider, or a different persistence
+layer for the core `STORAGE_KEY` payload; any of those would need the same explicit discussion Cloud
+Sync itself got, not an assumption that "cloud sync exists now" opens the door further.

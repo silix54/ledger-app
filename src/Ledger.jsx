@@ -1,8 +1,8 @@
-// Version: 6.4 - Phase 4 Item 3 (Predictive Forecasting & Runway Analytics)
+// Version: 6.6 - Phase 4 Item 4 follow-up (Dual-Provider Cloud Sync - Google Drive + Dropbox)
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
 import { BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
-import { Upload, Download, Plus, AlertCircle, Check, Copy, ChevronDown, Trash2, Settings, FolderOpen, Sun, Moon, X, Pencil, Undo2, Printer, ArrowUp, ArrowDown, LayoutGrid, Split, Merge } from "lucide-react";
+import { Upload, Download, Plus, AlertCircle, Check, Copy, ChevronDown, Trash2, Settings, FolderOpen, Sun, Moon, X, Pencil, Undo2, Printer, ArrowUp, ArrowDown, LayoutGrid, Split, Merge, Cloud, UploadCloud, DownloadCloud, LogOut, Loader2 } from "lucide-react";
 
 // System categories drive core calculations (savings tracking, income totals, transfer exclusion) -
 // not user-editable, since removing or renaming one would silently break the math elsewhere.
@@ -455,6 +455,287 @@ function normalizeDashboardLayout(layout) {
   return kept;
 }
 
+// --- Cloud Sync (Phase 4 Item 4, v6.5; dual-provider v6.6) -----------------------------------------
+// Optional, off-by-default sync to a cloud storage app-folder the person connects themselves - Google
+// Drive AppData (v6.5) or Dropbox (v6.6), picked via a provider toggle in Settings > Cloud Sync. This
+// is the one deliberate departure from the "zero network calls" rule CONTEXT.md §1 otherwise holds
+// the app to - see the CONTEXT.md v6.5/v6.6 entries for why it's still consistent with the no-backend
+// rule: every call below goes straight from this browser to Google's or Dropbox's own APIs, never
+// through anything this project runs or controls, and the payload either provider ever stores is
+// opaque ciphertext this browser encrypted with a passphrase neither provider ever sees. There is no
+// server-side component and never will be for this feature - if access to either provider is ever
+// revoked, or the person never opts in, the rest of the app is unaffected, since nothing here is read
+// by any other feature. The two providers share one encryption engine (encryptVaultPayload/
+// decryptVaultPayload below) and one plaintext payload shape - only the transport (auth flow + REST
+// calls to move the encrypted envelope) differs per provider.
+const CLOUD_CLIENT_ID_KEY = "ledger:cloudsync:clientid:v1";
+const CLOUD_LAST_SYNCED_KEY = "ledger:cloudsync:lastsynced:v1";
+const CLOUD_PROVIDER_KEY = "ledger:cloudsync:provider:v1";
+const GIS_SCOPE = "https://www.googleapis.com/auth/drive.appdata";
+const GIS_SCRIPT_SRC = "https://accounts.google.com/gsi/client";
+const DRIVE_VAULT_FILENAME = "ledger-vault.enc";
+const DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files";
+const DRIVE_UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files";
+const PBKDF2_ITERATIONS = 100000;
+
+function bufToBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+function base64ToBuf(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+// PBKDF2-SHA256 (100,000 iterations) turns the person's passphrase into an AES-GCM 256-bit key. The
+// passphrase itself is never stored (see cloudPassphrase in Ledger()) and never sent anywhere - only
+// this derived key is used, and only in memory, for exactly one encrypt or decrypt call.
+async function deriveAesKey(passphrase, saltBuf, iterations) {
+  const enc = new TextEncoder();
+  const baseKey = await window.crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
+  return window.crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt: saltBuf, iterations, hash: "SHA-256" },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+// Encrypts a plain JS value into a self-describing envelope, encoded as one JSON string - a fresh
+// random salt and IV every call, so re-syncing under the same passphrase never reuses key material.
+// Everything needed to decrypt (salt, iv, iteration count) travels alongside the ciphertext, since
+// this envelope is the only thing Drive ever sees - zero-knowledge means Google (or anyone with just
+// the file) never sees the passphrase or the plaintext ledger data, only this opaque blob.
+async function encryptVaultPayload(passphrase, value) {
+  const salt = window.crypto.getRandomValues(new Uint8Array(16));
+  const iv = window.crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveAesKey(passphrase, salt, PBKDF2_ITERATIONS);
+  const plaintext = new TextEncoder().encode(JSON.stringify(value));
+  const ciphertext = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext);
+  return JSON.stringify({
+    v: 1, kdf: "PBKDF2-SHA256", iterations: PBKDF2_ITERATIONS,
+    salt: bufToBase64(salt), iv: bufToBase64(iv), ciphertext: bufToBase64(ciphertext),
+  });
+}
+
+// Reverses encryptVaultPayload. Throws - AES-GCM's own authentication failure (wrong passphrase or a
+// tampered/corrupted file), or a JSON parse error on something that isn't this envelope shape at all -
+// on anything that isn't "this exact passphrase's own ciphertext, unmodified." Callers MUST catch this
+// and alert safely rather than let it reach a state setter, so a wrong passphrase can never partially
+// apply garbage data - the same "never corrupt local data" rule importData already follows for a bad
+// JSON backup file.
+async function decryptVaultPayload(passphrase, envelopeText) {
+  const envelope = JSON.parse(envelopeText);
+  if (!envelope || typeof envelope !== "object" || envelope.v !== 1
+    || typeof envelope.salt !== "string" || typeof envelope.iv !== "string" || typeof envelope.ciphertext !== "string") {
+    throw new Error("That file isn't a recognizable ledger vault.");
+  }
+  const salt = base64ToBuf(envelope.salt);
+  const iv = base64ToBuf(envelope.iv);
+  const iterations = Number.isFinite(envelope.iterations) ? envelope.iterations : PBKDF2_ITERATIONS;
+  const key = await deriveAesKey(passphrase, salt, iterations);
+  const plaintextBuf = await window.crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, base64ToBuf(envelope.ciphertext));
+  return JSON.parse(new TextDecoder().decode(plaintextBuf));
+}
+
+// Loads the Google Identity Services script on demand (never eagerly at module load, so a person who
+// never opens Cloud Sync never fetches anything from Google) and caches the in-flight promise at
+// module scope so multiple near-simultaneous callers (e.g. Connect clicked twice) share one script tag
+// instead of racing to inject duplicates.
+let _gisLoadPromise = null;
+function loadGisScript() {
+  if (typeof window !== "undefined" && window.google?.accounts?.oauth2) return Promise.resolve();
+  if (_gisLoadPromise) return _gisLoadPromise;
+  _gisLoadPromise = new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src="${GIS_SCRIPT_SRC}"]`);
+    if (existing) {
+      existing.addEventListener("load", () => resolve());
+      existing.addEventListener("error", () => reject(new Error("Couldn't load Google's sign-in script - check your connection and try again.")));
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = GIS_SCRIPT_SRC;
+    script.async = true;
+    script.defer = true;
+    script.onload = () => resolve();
+    script.onerror = () => { _gisLoadPromise = null; reject(new Error("Couldn't load Google's sign-in script - check your connection and try again.")); };
+    document.head.appendChild(script);
+  });
+  return _gisLoadPromise;
+}
+
+// Drive REST v3, scoped strictly to the hidden appDataFolder (never a person's visible Drive) by both
+// the OAuth scope requested (drive.appdata, see GIS_SCOPE) and every call below explicitly passing
+// spaces:"appDataFolder" / parents:["appDataFolder"] - this app can never see, list, or touch any file
+// outside the one it created for itself, and nothing it stores there is visible in the person's normal
+// Drive UI.
+async function driveFindVaultFileId(accessToken) {
+  const params = new URLSearchParams({
+    spaces: "appDataFolder",
+    q: `name='${DRIVE_VAULT_FILENAME}' and trashed=false`,
+    fields: "files(id,modifiedTime)",
+    pageSize: "1",
+  });
+  const res = await fetch(`${DRIVE_FILES_URL}?${params}`, { headers: { Authorization: `Bearer ${accessToken}` } });
+  if (!res.ok) throw new Error(`Couldn't reach Google Drive (${res.status}).`);
+  const data = await res.json();
+  return data.files && data.files[0] ? data.files[0].id : null;
+}
+
+// Overwrites in place (PATCH .../fileId?uploadType=media) if a vault file already exists, else creates
+// one via a multipart upload that sets both the file's metadata (name + appDataFolder parent) and its
+// content in one request. Either way the content is envelopeText - already-encrypted ciphertext; Drive
+// itself only ever receives opaque bytes, never plaintext ledger data.
+async function driveUploadVault(accessToken, fileId, envelopeText) {
+  if (fileId) {
+    const res = await fetch(`${DRIVE_UPLOAD_URL}/${fileId}?uploadType=media`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: envelopeText,
+    });
+    if (!res.ok) throw new Error(`Upload to Google Drive failed (${res.status}).`);
+    return res.json();
+  }
+  const boundary = "ledgervaultboundary";
+  const metadata = { name: DRIVE_VAULT_FILENAME, parents: ["appDataFolder"] };
+  const body = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n`
+    + `--${boundary}\r\nContent-Type: application/json\r\n\r\n${envelopeText}\r\n--${boundary}--`;
+  const res = await fetch(`${DRIVE_UPLOAD_URL}?uploadType=multipart`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": `multipart/related; boundary=${boundary}` },
+    body,
+  });
+  if (!res.ok) throw new Error(`Upload to Google Drive failed (${res.status}).`);
+  return res.json();
+}
+
+async function driveDownloadVault(accessToken, fileId) {
+  const res = await fetch(`${DRIVE_FILES_URL}/${fileId}?alt=media`, { headers: { Authorization: `Bearer ${accessToken}` } });
+  if (!res.ok) throw new Error(`Download from Google Drive failed (${res.status}).`);
+  return res.text();
+}
+
+// --- Dropbox provider (v6.6) ------------------------------------------------------------------------
+// Dropbox OAuth 2.0 with PKCE - the standard flow for a public client with no backend to hold a
+// secret. Unlike Google Identity Services (which can silently re-mint an access token in-page once a
+// scope is granted), Dropbox's PKCE flow is a genuine full-page redirect: this app navigates away to
+// dropbox.com and Dropbox navigates back with a one-time code in the URL (see the redirect-handling
+// effect in Ledger()). That means there's no in-page "connect" moment to hold a token in memory across
+// - so, unlike the Google access token, the Dropbox *refresh* token is persisted to localStorage
+// (DROPBOX_REFRESH_TOKEN_KEY) so re-syncing later doesn't force a full-page redirect every time. This
+// is a deliberate, documented trade-off (see CONTEXT.md's Cloud Sync subsection), not an oversight -
+// the token is scoped by the Dropbox app's own console configuration to just that app's folder, never
+// the person's whole Dropbox, and Disconnect both clears it locally and revokes it with Dropbox.
+const DROPBOX_APP_KEY_KEY = "ledger:cloudsync:dropbox:appkey:v1";
+const DROPBOX_REFRESH_TOKEN_KEY = "ledger:cloudsync:dropbox:refreshtoken:v1";
+const DROPBOX_LAST_SYNCED_KEY = "ledger:cloudsync:dropbox:lastsynced:v1";
+// sessionStorage, not localStorage - these only need to survive the single round-trip redirect to
+// Dropbox and back in this same tab, and are deleted the moment that round-trip completes either way.
+const DROPBOX_VERIFIER_SESSION_KEY = "ledger:cloudsync:dropbox:verifier";
+const DROPBOX_STATE_SESSION_KEY = "ledger:cloudsync:dropbox:state";
+const DROPBOX_AUTH_URL = "https://www.dropbox.com/oauth2/authorize";
+const DROPBOX_TOKEN_URL = "https://api.dropboxapi.com/oauth2/token";
+const DROPBOX_REVOKE_URL = "https://api.dropboxapi.com/2/auth/token/revoke";
+const DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload";
+const DROPBOX_DOWNLOAD_URL = "https://content.dropboxapi.com/2/files/download";
+const DROPBOX_VAULT_PATH = "/ledger-vault.enc";
+
+function base64UrlEncode(buf) {
+  return bufToBase64(buf).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+// RFC 7636 code_verifier: a random, URL-safe string 43-128 characters long. 64 random bytes
+// base64url-encodes to 86 characters, comfortably inside that range.
+function generatePkceVerifier() {
+  return base64UrlEncode(window.crypto.getRandomValues(new Uint8Array(64)).buffer);
+}
+async function sha256Base64Url(str) {
+  const digest = await window.crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
+  return base64UrlEncode(digest);
+}
+
+// Kicks off the PKCE flow: stashes a fresh verifier + anti-CSRF state in sessionStorage (read back by
+// the redirect-handling effect once Dropbox sends the person back), then navigates the whole page to
+// Dropbox's consent screen. This function never "returns" in the normal sense - the resolved promise
+// just means the redirect was issued, not that sign-in succeeded.
+//
+// Deliberately omits &scope= - the app's permissions come entirely from what's registered against
+// this App Key in the Dropbox App Console (Permissions tab), not from a scope list requested here.
+// Passing a scope param here would ask for exactly those scopes and fail if the console app wasn't
+// registered with a superset of them; omitting it lets Dropbox grant whatever the console app is
+// already configured for (expected to be files.content.write/files.content.read, scoped to the app's
+// own app folder - see the module comment above), with no risk of this code's scope list drifting out
+// of sync with the console's.
+async function startDropboxAuth(appKey) {
+  const verifier = generatePkceVerifier();
+  const state = base64UrlEncode(window.crypto.getRandomValues(new Uint8Array(16)).buffer);
+  const challenge = await sha256Base64Url(verifier);
+  window.sessionStorage.setItem(DROPBOX_VERIFIER_SESSION_KEY, verifier);
+  window.sessionStorage.setItem(DROPBOX_STATE_SESSION_KEY, state);
+  const redirectUri = window.location.origin + window.location.pathname;
+  const params = new URLSearchParams({
+    client_id: appKey, response_type: "code", code_challenge: challenge, code_challenge_method: "S256",
+    token_access_type: "offline", redirect_uri: redirectUri, state,
+  });
+  window.location.assign(`${DROPBOX_AUTH_URL}?${params}`);
+}
+
+// Trades the one-time authorization code (from the redirect back) for an access token + refresh token.
+// Must be called with the exact same redirectUri that was sent to startDropboxAuth, and the verifier
+// that produced the challenge sent there - Dropbox rejects the exchange otherwise.
+async function exchangeDropboxCode(appKey, code, verifier, redirectUri) {
+  const body = new URLSearchParams({ code, grant_type: "authorization_code", client_id: appKey, redirect_uri: redirectUri, code_verifier: verifier });
+  const res = await fetch(DROPBOX_TOKEN_URL, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
+  if (!res.ok) throw new Error(`Dropbox sign-in failed (${res.status}). Try connecting again.`);
+  return res.json();
+}
+// Silently mints a new short-lived access token from the persisted refresh token - no redirect, no
+// popup. Dropbox doesn't reliably return a new refresh token on this call, so the caller keeps using
+// the one it already has.
+async function refreshDropboxAccessToken(appKey, refreshToken) {
+  const body = new URLSearchParams({ refresh_token: refreshToken, grant_type: "refresh_token", client_id: appKey });
+  const res = await fetch(DROPBOX_TOKEN_URL, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
+  if (!res.ok) throw new Error(`Couldn't refresh Dropbox access (${res.status}) - try disconnecting and reconnecting.`);
+  return res.json();
+}
+async function dropboxRevokeToken(accessToken) {
+  await fetch(DROPBOX_REVOKE_URL, { method: "POST", headers: { Authorization: `Bearer ${accessToken}` } });
+}
+
+// The Dropbox-API-Arg header carries the call's JSON arguments (path, write mode) alongside the raw
+// ciphertext body - this app's Dropbox console entry is configured with "App folder" access, so this
+// path is relative to that dedicated app folder and this app can never see or touch anything else in
+// the person's Dropbox (see the module comment above). "mode: overwrite" makes Sync Now idempotent -
+// no separate find-then-update step like Drive needs, since Dropbox paths are stable names, not ids.
+async function dropboxUploadVault(accessToken, envelopeText) {
+  const res = await fetch(DROPBOX_UPLOAD_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/octet-stream",
+      "Dropbox-API-Arg": JSON.stringify({ path: DROPBOX_VAULT_PATH, mode: "overwrite", mute: true }),
+    },
+    body: envelopeText,
+  });
+  if (!res.ok) throw new Error(`Upload to Dropbox failed (${res.status}).`);
+  return res.json();
+}
+// Returns the envelope text, or null if no vault has been uploaded yet (Dropbox reports a missing path
+// as 409, not 404) - callers treat that exactly like Drive's "no file found yet" case.
+async function dropboxDownloadVault(accessToken) {
+  const res = await fetch(DROPBOX_DOWNLOAD_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Dropbox-API-Arg": JSON.stringify({ path: DROPBOX_VAULT_PATH }) },
+  });
+  if (res.status === 409) return null;
+  if (!res.ok) throw new Error(`Download from Dropbox failed (${res.status}).`);
+  return res.text();
+}
+
 const card = { background: "var(--surface-1)", border: "1px solid var(--border)", borderRadius: "14px", padding: "20px 22px", boxShadow: "0 1px 3px rgba(0,0,0,0.05)" };
 const label = { fontSize: "11px", fontWeight: 600, letterSpacing: "0.04em", textTransform: "uppercase", color: "var(--text-secondary)", marginBottom: "4px" };
 const num = { fontVariantNumeric: "tabular-nums" };
@@ -505,6 +786,8 @@ const THEME_CSS = `
 .ledger-root table tbody tr:hover td { background: var(--surface-2); }
 .ledger-root .ledger-tabs button { border-radius: 8px 8px 0 0; }
 .ledger-root .ledger-tabs button:hover { background: var(--surface-2) !important; }
+@keyframes ledger-spin { to { transform: rotate(360deg); } }
+.ledger-root .ledger-spin { animation: ledger-spin 0.9s linear infinite; }
 `;
 
 // Print stylesheet for the Dashboard's "Print / Save PDF" export. Standard print-one-section trick:
@@ -808,6 +1091,337 @@ export default function Ledger() {
   }, [hasUnsavedChanges, staging.length]);
 
   const [storageWarning, setStorageWarning] = useState("");
+
+  // --- Cloud Sync (Phase 4 Item 4, v6.5; dual-provider v6.6): see the module-level "Cloud Sync" block
+  // above for the crypto/GIS/Drive/Dropbox helper functions. Only per-browser config (Client ID/App
+  // Key, which provider is selected, last-synced timestamps) is persisted - same pattern as THEME_KEY,
+  // never part of STORAGE_KEY or JSON export/import, since none of it is financial data. The
+  // passphrase is always memory-only for both providers. The Google access token is memory-only too
+  // (GIS can silently re-mint it); the Dropbox refresh token is the one exception, persisted because
+  // Dropbox's redirect-based flow has no in-page equivalent - see the module-level Dropbox comment.
+  const [cloudProvider, setCloudProviderState] = useState(() => {
+    try { const saved = window.localStorage.getItem(CLOUD_PROVIDER_KEY); return saved === "dropbox" ? "dropbox" : "google"; } catch { return "google"; }
+  });
+  const [cloudClientId, setCloudClientId] = useState(() => {
+    try { return window.localStorage.getItem(CLOUD_CLIENT_ID_KEY) || ""; } catch { return ""; }
+  });
+  const [cloudPassphrase, setCloudPassphrase] = useState("");
+  const [cloudAccessToken, setCloudAccessToken] = useState(null); // { token, expiresAt } | null - memory-only
+  const [cloudStatus, setCloudStatus] = useState("idle"); // "idle" | "encrypting" | "syncing" | "error" | "success"
+  const [cloudStatusMessage, setCloudStatusMessage] = useState("");
+  const [cloudLastSynced, setCloudLastSynced] = useState(() => {
+    try { return window.localStorage.getItem(CLOUD_LAST_SYNCED_KEY) || ""; } catch { return ""; }
+  });
+  // Holds the GIS token client instance once created, keyed by which Client ID it was built for, so
+  // editing the Client ID field transparently rebuilds it on the next connect rather than silently
+  // reusing a token client tied to a stale/wrong id.
+  const cloudTokenClientRef = useRef(null);
+
+  // --- Dropbox provider state (v6.6) - see the module-level Dropbox comment for why the refresh token
+  // is persisted while the Google access token above isn't.
+  const [dropboxAppKey, setDropboxAppKey] = useState(() => {
+    try { return window.localStorage.getItem(DROPBOX_APP_KEY_KEY) || ""; } catch { return ""; }
+  });
+  const [dropboxAccessToken, setDropboxAccessToken] = useState(null); // { token, expiresAt } | null - memory-only
+  const [dropboxRefreshToken, setDropboxRefreshToken] = useState(() => {
+    try { return window.localStorage.getItem(DROPBOX_REFRESH_TOKEN_KEY) || ""; } catch { return ""; }
+  });
+  const [dropboxLastSynced, setDropboxLastSynced] = useState(() => {
+    try { return window.localStorage.getItem(DROPBOX_LAST_SYNCED_KEY) || ""; } catch { return ""; }
+  });
+
+  function setCloudProvider(provider) {
+    setCloudProviderState(provider);
+    setCloudStatus("idle");
+    setCloudStatusMessage("");
+  }
+
+  useEffect(() => {
+    try { window.localStorage.setItem(CLOUD_PROVIDER_KEY, cloudProvider); } catch { /* non-critical config - safe to lose */ }
+  }, [cloudProvider]);
+  useEffect(() => {
+    try { window.localStorage.setItem(CLOUD_CLIENT_ID_KEY, cloudClientId); } catch { /* non-critical config - safe to lose */ }
+  }, [cloudClientId]);
+  useEffect(() => {
+    try { window.localStorage.setItem(DROPBOX_APP_KEY_KEY, dropboxAppKey); } catch { /* non-critical config - safe to lose */ }
+  }, [dropboxAppKey]);
+  useEffect(() => {
+    try {
+      if (dropboxRefreshToken) window.localStorage.setItem(DROPBOX_REFRESH_TOKEN_KEY, dropboxRefreshToken);
+      else window.localStorage.removeItem(DROPBOX_REFRESH_TOKEN_KEY);
+    } catch { /* non-critical - worst case, reconnecting to Dropbox is one redirect away */ }
+  }, [dropboxRefreshToken]);
+
+  // Completes the Dropbox PKCE round trip: if this load's URL carries ?code=&state= (Dropbox sending
+  // the person back after startDropboxAuth navigated away), exchanges the code for tokens, switches to
+  // the Dropbox provider, and scrubs the URL so a refresh can't replay the one-time code. A normal load
+  // (no code/error present) is a no-op. Runs once on mount - this is a one-time consumption of
+  // whatever the browser's URL happened to be on arrival, not a subscription to anything that should
+  // re-run as component state changes later.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get("code");
+    const authError = params.get("error");
+    if (!code && !authError) return;
+    const returnedState = params.get("state");
+    const redirectUri = window.location.origin + window.location.pathname;
+    (async () => {
+      try {
+        if (authError) throw new Error(params.get("error_description") || "Dropbox sign-in was cancelled.");
+        const expectedState = window.sessionStorage.getItem(DROPBOX_STATE_SESSION_KEY);
+        const verifier = window.sessionStorage.getItem(DROPBOX_VERIFIER_SESSION_KEY);
+        if (!verifier || !returnedState || returnedState !== expectedState) {
+          throw new Error("Dropbox sign-in couldn't be verified - try connecting again.");
+        }
+        setCloudStatus("syncing"); setCloudStatusMessage("Finishing Dropbox sign-in...");
+        // Reads the persisted App Key straight from localStorage rather than the dropboxAppKey state
+        // variable - this effect intentionally runs exactly once, on whatever URL the page happened to
+        // load with, so it deliberately doesn't take dropboxAppKey as a reactive dependency. By the
+        // time Dropbox redirects back here, startDropboxAuth's caller already persisted it (see the
+        // dropboxAppKey persist effect above), so this reads the same value either way.
+        let persistedAppKey = "";
+        try { persistedAppKey = window.localStorage.getItem(DROPBOX_APP_KEY_KEY) || ""; } catch { /* falls through to the empty-key error below */ }
+        const resp = await exchangeDropboxCode(persistedAppKey.trim(), code, verifier, redirectUri);
+        setDropboxAccessToken({ token: resp.access_token, expiresAt: new Date().getTime() + (Number(resp.expires_in) || 14400) * 1000 });
+        if (resp.refresh_token) setDropboxRefreshToken(resp.refresh_token);
+        setCloudProviderState("dropbox");
+        setTab("settings");
+        setCloudStatus("success"); setCloudStatusMessage("Connected to Dropbox. Enter a passphrase, then Sync now or Pull from cloud.");
+      } catch (err) {
+        setCloudStatus("error"); setCloudStatusMessage(err.message || "Dropbox sign-in failed.");
+      } finally {
+        window.sessionStorage.removeItem(DROPBOX_VERIFIER_SESSION_KEY);
+        window.sessionStorage.removeItem(DROPBOX_STATE_SESSION_KEY);
+        window.history.replaceState(null, "", redirectUri);
+      }
+    })();
+  }, []);
+
+  function isCloudTokenValid() {
+    return !!(cloudAccessToken && cloudAccessToken.expiresAt > new Date().getTime() + 30000);
+  }
+
+  // Lazily creates (or rebuilds, if the Client ID changed) the GIS token client, then requests an
+  // access token. GIS's initTokenClient callback is fixed at creation time but requestAccessToken has
+  // no per-call return value, so - the documented GIS pattern - the callback is reassigned on the
+  // token client instance immediately before each request, and this promise resolves/rejects from
+  // inside that reassigned callback.
+  function requestCloudAccessToken() {
+    return new Promise((resolve, reject) => {
+      const clientId = cloudClientId.trim();
+      if (!clientId) { reject(new Error("Enter your Google Client ID above first.")); return; }
+      loadGisScript().then(() => {
+        if (!cloudTokenClientRef.current || cloudTokenClientRef.current.clientId !== clientId) {
+          cloudTokenClientRef.current = {
+            clientId,
+            client: window.google.accounts.oauth2.initTokenClient({ client_id: clientId, scope: GIS_SCOPE, callback: () => {} }),
+          };
+        }
+        cloudTokenClientRef.current.client.callback = (resp) => {
+          if (resp.error) { reject(new Error(resp.error_description || resp.error)); return; }
+          const token = { token: resp.access_token, expiresAt: new Date().getTime() + (Number(resp.expires_in) || 3600) * 1000 };
+          setCloudAccessToken(token);
+          resolve(token.token);
+        };
+        cloudTokenClientRef.current.client.requestAccessToken();
+      }).catch(reject);
+    });
+  }
+  // Reuses the current token while it still has headroom; otherwise requests a fresh one. Since the
+  // scope was already granted, GIS typically issues this silently (no popup) rather than re-prompting.
+  async function getCloudAccessToken() {
+    if (isCloudTokenValid()) return cloudAccessToken.token;
+    return requestCloudAccessToken();
+  }
+
+  async function connectGoogle() {
+    try {
+      setCloudStatus("syncing"); setCloudStatusMessage("Connecting to your Google account...");
+      await requestCloudAccessToken();
+      setCloudStatus("success"); setCloudStatusMessage("Connected. Enter a passphrase, then Sync now or Pull from cloud.");
+    } catch (err) {
+      setCloudStatus("error"); setCloudStatusMessage(err.message || "Couldn't connect to Google.");
+    }
+  }
+  // Revokes the OAuth grant (best-effort - local state is cleared either way) and drops every
+  // in-memory credential. The passphrase is cleared too, on the same reasoning it was never persisted
+  // in the first place: once "disconnected" means disconnected, not "still holding secrets in memory."
+  function disconnectGoogle() {
+    const token = cloudAccessToken?.token;
+    setCloudAccessToken(null);
+    setCloudPassphrase("");
+    cloudTokenClientRef.current = null;
+    setCloudStatus("idle"); setCloudStatusMessage("Disconnected.");
+    try {
+      if (token && window.google?.accounts?.oauth2?.revoke) window.google.accounts.oauth2.revoke(token, () => {});
+    } catch { /* best-effort revoke - local state is already cleared regardless */ }
+  }
+
+  // Reuses the current Dropbox access token while it still has headroom; otherwise silently mints a
+  // fresh one from the persisted refresh token - no redirect needed for this part.
+  async function getDropboxAccessToken() {
+    if (dropboxAccessToken && dropboxAccessToken.expiresAt > new Date().getTime() + 30000) return dropboxAccessToken.token;
+    if (!dropboxRefreshToken) throw new Error("Connect your Dropbox account first.");
+    const resp = await refreshDropboxAccessToken(dropboxAppKey.trim(), dropboxRefreshToken);
+    const token = { token: resp.access_token, expiresAt: new Date().getTime() + (Number(resp.expires_in) || 14400) * 1000 };
+    setDropboxAccessToken(token);
+    return token.token;
+  }
+  // Connecting to Dropbox is a full-page redirect (see the module-level Dropbox comment), which would
+  // silently discard any not-yet-committed staged import rows (staging is transient, never persisted -
+  // see CONTEXT.md's Staging rows subsection) - so this warns and lets the person cancel first, the
+  // same way other destructive-ish actions in this app confirm() before proceeding.
+  async function connectDropbox() {
+    const appKey = dropboxAppKey.trim();
+    if (!appKey) { setCloudStatus("error"); setCloudStatusMessage("Enter your Dropbox App Key above first."); return; }
+    if (staging.length > 0) {
+      const ok = confirm(`You have ${staging.length} staged transaction${staging.length !== 1 ? "s" : ""} not yet added to your log. Connecting to Dropbox reloads this page, which would lose them. Continue anyway?`);
+      if (!ok) return;
+    }
+    try {
+      setCloudStatus("syncing"); setCloudStatusMessage("Redirecting to Dropbox...");
+      await startDropboxAuth(appKey);
+    } catch (err) {
+      setCloudStatus("error"); setCloudStatusMessage(err.message || "Couldn't start Dropbox sign-in.");
+    }
+  }
+  // Drops the persisted refresh token (so this browser can no longer mint new Dropbox access tokens
+  // without a fresh redirect) and best-effort revokes it with Dropbox if a live access token happens
+  // to be in memory - unlike Google, there's no in-memory token to revoke on a fresh page load, so
+  // local removal (the part that actually matters - see the module-level Dropbox comment) always
+  // happens regardless of whether the network revoke call succeeds.
+  function disconnectDropbox() {
+    const token = dropboxAccessToken?.token;
+    setDropboxAccessToken(null);
+    setDropboxRefreshToken("");
+    setCloudPassphrase("");
+    setCloudStatus("idle"); setCloudStatusMessage("Disconnected from Dropbox.");
+    if (token) dropboxRevokeToken(token).catch(() => { /* best-effort - local state is already cleared regardless */ });
+  }
+
+  function markCloudSynced(provider) {
+    const now = new Date().toISOString();
+    if (provider === "dropbox") {
+      setDropboxLastSynced(now);
+      try { window.localStorage.setItem(DROPBOX_LAST_SYNCED_KEY, now); } catch { /* non-critical */ }
+    } else {
+      setCloudLastSynced(now);
+      try { window.localStorage.setItem(CLOUD_LAST_SYNCED_KEY, now); } catch { /* non-critical */ }
+    }
+  }
+
+  // Sync Now: encrypts the exact same payload shape exportData/importData use (one shared encryption
+  // engine for both providers - see encryptVaultPayload), then uploads it to whichever provider is
+  // currently selected. Encryption happens before any network call, so a slow or failed upload can
+  // never leave plaintext in flight.
+  async function syncNowToCloud() {
+    if (!cloudPassphrase) { alert("Enter a passphrase first - it's needed to encrypt your data before upload."); return; }
+    const providerLabel = cloudProvider === "dropbox" ? "Dropbox" : "Google Drive";
+    try {
+      setCloudStatus("encrypting"); setCloudStatusMessage("Encrypting your data...");
+      const payload = { transactions, lookup, spendingCategories, budget, recurringConfig, dashboardLayout, exportedAt: new Date().toISOString() };
+      const envelopeText = await encryptVaultPayload(cloudPassphrase, payload);
+      setCloudStatus("syncing"); setCloudStatusMessage(`Uploading to ${providerLabel}...`);
+      if (cloudProvider === "dropbox") {
+        const accessToken = await getDropboxAccessToken();
+        await dropboxUploadVault(accessToken, envelopeText);
+      } else {
+        const accessToken = await getCloudAccessToken();
+        const existingFileId = await driveFindVaultFileId(accessToken);
+        await driveUploadVault(accessToken, existingFileId, envelopeText);
+      }
+      markCloudSynced(cloudProvider);
+      setCloudStatus("success"); setCloudStatusMessage(`Synced to ${providerLabel}.`);
+    } catch (err) {
+      setCloudStatus("error"); setCloudStatusMessage(err.message || "Sync failed.");
+    }
+  }
+
+  // Pull from Cloud: downloads ledger-vault.enc from whichever provider is selected, decrypts it in
+  // memory via the same shared engine Sync Now uses, then applies it with exactly the same "validate
+  // every section before applying anything" rule importData follows for a JSON backup file - a
+  // malformed or wrong-passphrase cloud payload can no more partially corrupt local data than a
+  // malformed backup file can. A decrypt failure in particular (almost always a wrong passphrase) is
+  // caught on its own and alerted safely, before any validation or state update runs.
+  async function pullFromCloud() {
+    if (!cloudPassphrase) { alert("Enter your passphrase first - it's needed to decrypt the cloud backup."); return; }
+    const providerLabel = cloudProvider === "dropbox" ? "Dropbox" : "Google Drive";
+    const ok = confirm(`Pulling from the cloud will overwrite this browser's current ledger data with whatever's stored in ${providerLabel}. Continue?`);
+    if (!ok) return;
+    try {
+      setCloudStatus("syncing"); setCloudStatusMessage(`Connecting to ${providerLabel}...`);
+      let envelopeText;
+      if (cloudProvider === "dropbox") {
+        const accessToken = await getDropboxAccessToken();
+        envelopeText = await dropboxDownloadVault(accessToken);
+      } else {
+        const accessToken = await getCloudAccessToken();
+        const fileId = await driveFindVaultFileId(accessToken);
+        envelopeText = fileId ? await driveDownloadVault(accessToken, fileId) : null;
+      }
+      if (!envelopeText) { setCloudStatus("error"); setCloudStatusMessage(`No cloud backup found yet on ${providerLabel} - use Sync now first.`); return; }
+
+      setCloudStatus("encrypting"); setCloudStatusMessage("Decrypting...");
+      let payload;
+      try {
+        payload = await decryptVaultPayload(cloudPassphrase, envelopeText);
+      } catch {
+        // Wrong passphrase, or a corrupted/foreign file - alert safely and stop here. Nothing local
+        // has been touched, matching importData's "validate before applying anything" rule.
+        setCloudStatus("error"); setCloudStatusMessage("Decryption failed - check your passphrase.");
+        alert("Couldn't decrypt the cloud backup. Check your passphrase and try again. Your local data hasn't been changed.");
+        return;
+      }
+      if (!payload || typeof payload !== "object") {
+        setCloudStatus("error"); setCloudStatusMessage("The decrypted cloud backup was empty or malformed.");
+        alert("The decrypted cloud backup doesn't look like a ledger backup. Nothing was imported - your local data is unchanged.");
+        return;
+      }
+
+      const hasT = "transactions" in payload, hasL = "lookup" in payload, hasB = "budget" in payload;
+      const hasC = "spendingCategories" in payload, hasRC = "recurringConfig" in payload, hasDL = "dashboardLayout" in payload;
+      if (hasT && (!Array.isArray(payload.transactions) || payload.transactions.length > MAX_IMPORT_ROWS || !payload.transactions.every(isValidTransaction))) {
+        throw new Error("The transactions in the cloud backup look malformed. Nothing was imported - your local data is unchanged.");
+      }
+      if (hasL && (!Array.isArray(payload.lookup) || !payload.lookup.every(isValidLookupEntry))) {
+        throw new Error("The merchant lookup table in the cloud backup looks malformed. Nothing was imported - your local data is unchanged.");
+      }
+      if (hasB && !isValidBudget(payload.budget)) {
+        throw new Error("The budget assumptions in the cloud backup look malformed. Nothing was imported - your local data is unchanged.");
+      }
+      if (hasC && (!Array.isArray(payload.spendingCategories) || !payload.spendingCategories.every(c => typeof c === "string"))) {
+        throw new Error("The category list in the cloud backup looks malformed. Nothing was imported - your local data is unchanged.");
+      }
+      if (hasRC && !isValidRecurringConfig(payload.recurringConfig)) {
+        throw new Error("The recurring-detection settings in the cloud backup look malformed. Nothing was imported - your local data is unchanged.");
+      }
+      if (hasDL && !isValidDashboardLayout(payload.dashboardLayout)) {
+        throw new Error("The dashboard layout settings in the cloud backup look malformed. Nothing was imported - your local data is unchanged.");
+      }
+
+      // All validated - apply as one batch, same as importData.
+      if (hasT || hasL || hasB || hasC || hasRC || hasDL) suppressDirtyCheck.current = true;
+      if (hasT) {
+        const reindexed = migrateWealthsimpleTransactions(payload.transactions.map((t, i) => ({ ...t, id: i })));
+        setTransactions(reindexed);
+        nextId.current = computeNextId(reindexed);
+        setLastImportBatch(null);
+        setSelectedTxnIds(new Set());
+      }
+      if (hasL) setLookup(sortLookup(migrateWealthsimpleLookup(payload.lookup)));
+      if (hasB) setBudget(prev => ({ ...prev, ...migrateBudget(payload.budget) }));
+      if (hasC) setSpendingCategories(ensureWealthsimpleCategory(payload.spendingCategories));
+      if (hasRC) setRecurringConfig(payload.recurringConfig);
+      if (hasDL) setDashboardLayout(normalizeDashboardLayout(payload.dashboardLayout));
+      setHasUnsavedChanges(false);
+
+      markCloudSynced(cloudProvider);
+      setCloudStatus("success"); setCloudStatusMessage(`Restored from ${providerLabel}.`);
+    } catch (err) {
+      setCloudStatus("error"); setCloudStatusMessage(err.message || "Pull failed.");
+      alert(err.message || "Couldn't pull from the cloud. Your local data hasn't been changed.");
+    }
+  }
 
   // Autosave: mirrors transactions/lookup/spendingCategories/budget into localStorage on every
   // change, in the same shape a manual JSON export uses. This is separate from hasUnsavedChanges -
@@ -2394,6 +3008,16 @@ export default function Ledger() {
         spendingCategories={spendingCategories} addCategory={addCategory} renameCategory={renameCategory} removeCategory={removeCategory}
         lookup={lookup} allCategories={allCategories} addLookupRule={addLookupRule} updateLookupRuleCategory={updateLookupRuleCategory} removeLookupRule={removeLookupRule}
         recurringConfig={recurringConfig} updateRecurringConfig={updateRecurringConfig} resetRecurringConfig={resetRecurringConfig}
+        cloudProvider={cloudProvider} setCloudProvider={setCloudProvider}
+        cloudClientId={cloudClientId} setCloudClientId={setCloudClientId}
+        dropboxAppKey={dropboxAppKey} setDropboxAppKey={setDropboxAppKey}
+        cloudPassphrase={cloudPassphrase} setCloudPassphrase={setCloudPassphrase}
+        googleConnected={!!cloudAccessToken} dropboxConnected={!!dropboxRefreshToken}
+        cloudStatus={cloudStatus} cloudStatusMessage={cloudStatusMessage}
+        cloudLastSynced={cloudLastSynced} dropboxLastSynced={dropboxLastSynced}
+        onConnectGoogle={connectGoogle} onDisconnectGoogle={disconnectGoogle}
+        onConnectDropbox={connectDropbox} onDisconnectDropbox={disconnectDropbox}
+        onSyncNowToCloud={syncNowToCloud} onPullFromCloud={pullFromCloud}
       />}
     </div>
   );
@@ -2443,7 +3067,13 @@ function RegexRuleTester() {
   );
 }
 
-function SettingsTab({ spendingCategories, addCategory, renameCategory, removeCategory, lookup, allCategories, addLookupRule, updateLookupRuleCategory, removeLookupRule, recurringConfig, updateRecurringConfig, resetRecurringConfig }) {
+function SettingsTab({
+  spendingCategories, addCategory, renameCategory, removeCategory, lookup, allCategories, addLookupRule, updateLookupRuleCategory, removeLookupRule,
+  recurringConfig, updateRecurringConfig, resetRecurringConfig,
+  cloudProvider, setCloudProvider, cloudClientId, setCloudClientId, dropboxAppKey, setDropboxAppKey,
+  cloudPassphrase, setCloudPassphrase, googleConnected, dropboxConnected, cloudStatus, cloudStatusMessage, cloudLastSynced, dropboxLastSynced,
+  onConnectGoogle, onDisconnectGoogle, onConnectDropbox, onDisconnectDropbox, onSyncNowToCloud, onPullFromCloud,
+}) {
   const [newCat, setNewCat] = useState("");
   const [editingCat, setEditingCat] = useState(null);
   const [editingCatValue, setEditingCatValue] = useState("");
@@ -2555,6 +3185,126 @@ function SettingsTab({ spendingCategories, addCategory, renameCategory, removeCa
           </div>
         </div>
       </div>
+
+      <CloudSyncPanel
+        cloudProvider={cloudProvider} setCloudProvider={setCloudProvider}
+        cloudClientId={cloudClientId} setCloudClientId={setCloudClientId}
+        dropboxAppKey={dropboxAppKey} setDropboxAppKey={setDropboxAppKey}
+        cloudPassphrase={cloudPassphrase} setCloudPassphrase={setCloudPassphrase}
+        googleConnected={googleConnected} dropboxConnected={dropboxConnected}
+        cloudStatus={cloudStatus} cloudStatusMessage={cloudStatusMessage}
+        cloudLastSynced={cloudLastSynced} dropboxLastSynced={dropboxLastSynced}
+        onConnectGoogle={onConnectGoogle} onDisconnectGoogle={onDisconnectGoogle}
+        onConnectDropbox={onConnectDropbox} onDisconnectDropbox={onDisconnectDropbox}
+        onSyncNow={onSyncNowToCloud} onPullFromCloud={onPullFromCloud}
+      />
+    </div>
+  );
+}
+
+// Settings > Cloud sync: the dual-provider (Google Drive v6.5 / Dropbox v6.6) panel. Purely a
+// controlled view over state owned by Ledger() - every field here is a prop, so this component holds
+// no secrets of its own beyond the local "which provider tab is showing" and "show/hide passphrase"
+// UI state, and unmounting it (switching tabs) can never lose in-progress state the way an
+// uncontrolled input would. Sync Now / Pull from Cloud are one shared pair of buttons - Ledger()'s
+// syncNowToCloud/pullFromCloud already branch on cloudProvider internally, so this panel only needs to
+// pick which provider's config/connect fields to show, not which action to wire up.
+function CloudSyncPanel({
+  cloudProvider, setCloudProvider, cloudClientId, setCloudClientId, dropboxAppKey, setDropboxAppKey,
+  cloudPassphrase, setCloudPassphrase, googleConnected, dropboxConnected,
+  cloudStatus, cloudStatusMessage, cloudLastSynced, dropboxLastSynced,
+  onConnectGoogle, onDisconnectGoogle, onConnectDropbox, onDisconnectDropbox, onSyncNow, onPullFromCloud,
+}) {
+  const [showPassphrase, setShowPassphrase] = useState(false);
+  const busy = cloudStatus === "encrypting" || cloudStatus === "syncing";
+  const statusColor = cloudStatus === "error" ? "var(--text-danger)" : cloudStatus === "success" ? "var(--text-success)" : cloudStatus === "idle" ? "var(--text-secondary)" : "var(--text-accent)";
+  const statusLabel = { idle: "Idle", encrypting: "Encrypting", syncing: "Syncing", error: "Error", success: "Success" }[cloudStatus] || cloudStatus;
+
+  const isDropbox = cloudProvider === "dropbox";
+  const connected = isDropbox ? dropboxConnected : googleConnected;
+  const lastSynced = isDropbox ? dropboxLastSynced : cloudLastSynced;
+  const providerConfigReady = (isDropbox ? dropboxAppKey : cloudClientId).trim().length > 0;
+  const onConnect = isDropbox ? onConnectDropbox : onConnectGoogle;
+  const onDisconnect = isDropbox ? onDisconnectDropbox : onDisconnectGoogle;
+
+  return (
+    <div style={card}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px", flexWrap: "wrap", gap: "8px" }}>
+        <div style={label}>Cloud sync</div>
+        <span style={{ fontSize: "12px", fontWeight: 600, color: statusColor, display: "flex", alignItems: "center", gap: "5px" }}>
+          {busy && <Loader2 size={13} className="ledger-spin" />}
+          {statusLabel}
+        </span>
+      </div>
+      <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 12px" }}>
+        Optional. Backs your ledger up to your own Google Drive or Dropbox app storage - invisible in
+        your normal Drive/Dropbox, and never readable by this app or the provider as plaintext. Your
+        data is encrypted with your passphrase in this browser before it's ever uploaded (AES-GCM, key
+        derived via PBKDF2) - the same encryption either way, so switching providers doesn't change
+        what's protecting your data, only where the encrypted file goes. There's still no backend
+        server here: every request below goes straight from this browser to the selected provider's
+        own APIs. There is no password recovery - if you lose the passphrase, a cloud backup on either
+        provider can't be decrypted, by anyone.
+      </p>
+
+      <div className="ledger-tabs" style={{ display: "flex", gap: "4px", marginBottom: "12px", borderBottom: "1px solid var(--border)" }}>
+        {[{ id: "google", label: "Google Drive" }, { id: "dropbox", label: "Dropbox" }].map(p => (
+          <button key={p.id} type="button" onClick={() => setCloudProvider(p.id)}
+            style={{ padding: "7px 14px", background: "none", border: "none", borderBottom: cloudProvider === p.id ? "2px solid var(--text-accent)" : "2px solid transparent", color: cloudProvider === p.id ? "var(--text-primary)" : "var(--text-secondary)", fontSize: "13px", fontWeight: cloudProvider === p.id ? 600 : 500 }}>
+            {p.label}
+          </button>
+        ))}
+      </div>
+
+      <div style={{ display: "grid", gap: "10px", marginBottom: "12px" }}>
+        {isDropbox ? (
+          <div>
+            <div style={label}>Dropbox App Key</div>
+            <input value={dropboxAppKey} onChange={e => setDropboxAppKey(e.target.value)} placeholder="Dropbox App Key" style={{ ...input, fontFamily: "var(--font-mono)" }} disabled={connected} />
+            <p style={{ fontSize: "11px", color: "var(--text-muted)", margin: "4px 0 0" }}>From your own app in the Dropbox App Console, created with "App folder" access. Saved only to this browser - never hardcoded or bundled with the app. Connecting redirects this whole page to Dropbox and back - save any staged (not-yet-confirmed) import rows first.</p>
+          </div>
+        ) : (
+          <div>
+            <div style={label}>Google Client ID</div>
+            <input value={cloudClientId} onChange={e => setCloudClientId(e.target.value)} placeholder="xxxxxxxxxxxx.apps.googleusercontent.com" style={{ ...input, fontFamily: "var(--font-mono)" }} disabled={connected} />
+            <p style={{ fontSize: "11px", color: "var(--text-muted)", margin: "4px 0 0" }}>From an OAuth client (type "Web application") in your own Google Cloud project. Saved only to this browser - never hardcoded or bundled with the app.</p>
+          </div>
+        )}
+        <div>
+          <div style={label}>Encryption passphrase</div>
+          <div style={{ display: "flex", gap: "8px" }}>
+            <input type={showPassphrase ? "text" : "password"} value={cloudPassphrase} onChange={e => setCloudPassphrase(e.target.value)} placeholder="Never saved - re-enter each session" style={{ ...input, flex: 1 }} autoComplete="off" />
+            <button type="button" style={{ ...btn, padding: "8px 10px" }} onClick={() => setShowPassphrase(s => !s)}>{showPassphrase ? "Hide" : "Show"}</button>
+          </div>
+          <p style={{ fontSize: "11px", color: "var(--text-muted)", margin: "4px 0 0" }}>Shared across both providers - it's only ever used locally to derive an encryption key, never sent to either one.</p>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "10px" }}>
+        {!connected ? (
+          <button type="button" style={{ ...btnPrimary, opacity: providerConfigReady && !busy ? 1 : 0.5 }} disabled={!providerConfigReady || busy} onClick={onConnect}>
+            <Cloud size={14} /> Connect {isDropbox ? "Dropbox" : "Google"} account
+          </button>
+        ) : (
+          <>
+            <button type="button" style={{ ...btnPrimary, opacity: !busy && cloudPassphrase ? 1 : 0.5 }} disabled={busy || !cloudPassphrase} onClick={onSyncNow}>
+              <UploadCloud size={14} /> Sync now (upload)
+            </button>
+            <button type="button" style={{ ...btn, opacity: !busy && cloudPassphrase ? 1 : 0.5 }} disabled={busy || !cloudPassphrase} onClick={onPullFromCloud}>
+              <DownloadCloud size={14} /> Pull from cloud (restore)
+            </button>
+            <button type="button" style={btn} disabled={busy} onClick={onDisconnect}><LogOut size={14} /> Disconnect</button>
+          </>
+        )}
+      </div>
+
+      {cloudStatusMessage && (
+        <div style={{ fontSize: "12px", color: statusColor, marginBottom: "8px" }}>
+          {cloudStatus === "error" && <AlertCircle size={13} style={{ verticalAlign: "-2px", marginRight: "4px" }} />}
+          {cloudStatusMessage}
+        </div>
+      )}
+      <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>Last synced ({isDropbox ? "Dropbox" : "Google Drive"}): {lastSynced ? new Date(lastSynced).toLocaleString() : "Never"}</div>
     </div>
   );
 }
