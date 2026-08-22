@@ -1,12 +1,12 @@
-// Version: 6.9.10 - Smart header-row detection skips preamble/metadata rows above the real CSV
-// header (scans first 10 rows for 2+ column keywords); added YYYYMMDD/YYMMDD compact date parsing;
-// Date/Amount column auto-mapping now matches priority alias lists ("Transaction Date"/"Transaction
-// Amount" etc.) instead of only exact "date"/"amount"; BMO Mastercard exports are now auto-detected
-// and default to a named "BMO Mastercard" account
+// Version: 6.9.11 - Retroactive "Scan Duplicates" tool in the Transaction Log (findDuplicateClusters:
+// matching amount + date within 1 day + matching/substring merchant text) with a Duplicate Cleaner
+// review modal and a toast on delete; Customizable Category Behaviors in Settings (per-category
+// Income/Expense/Neutral override, backwards-compatible with the old INCOME:/TRANSFER:/EXCLUDE:
+// prefix convention) now drives classifyTxnKind and every Dashboard total that depends on it
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
 import { BarChart, Bar, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
-import { Upload, Download, Plus, AlertCircle, Check, Copy, ChevronDown, ChevronUp, Trash2, Settings, FolderOpen, Sun, Moon, X, Pencil, Undo2, Printer, ArrowUp, ArrowDown, LayoutGrid, Split, Merge, Cloud, UploadCloud, DownloadCloud, LogOut, Loader2, Lock, Fingerprint, Delete, KeyRound } from "lucide-react";
+import { Upload, Download, Plus, AlertCircle, Check, Copy, ChevronDown, ChevronUp, Trash2, Settings, FolderOpen, Sun, Moon, X, Pencil, Undo2, Printer, ArrowUp, ArrowDown, LayoutGrid, Split, Merge, Cloud, UploadCloud, DownloadCloud, LogOut, Loader2, Lock, Fingerprint, Delete, KeyRound, ScanSearch } from "lucide-react";
 
 // System categories drive core calculations (savings tracking, income totals, transfer exclusion) -
 // not user-editable, since removing or renaming one would silently break the math elsewhere.
@@ -33,24 +33,42 @@ const DEFAULT_SPENDING_CATEGORIES = ["Giving","Groceries","Dining","Health","Pha
 const NON_SPEND = new Set(SYSTEM_CATEGORIES);
 const INCOME_CATS = new Set(["INCOME: Employment","INCOME: Benefits","INCOME: Reimbursement","INCOME: Resale"]);
 
-// --- Sign-resilient category classification (Dashboard Overhaul) ------------------------------
-// Classifies a transaction into "income" | "transfer" | "excluded" | "expense" by its category's
-// semantic prefix rather than raw amount sign alone, so an income row saved with the wrong sign (or a
-// transfer that was never really spend to begin with) doesn't quietly distort the Dashboard's totals.
-// Amount sign only gets the final word for a genuinely uncategorized row, since "no category yet"
-// isn't itself a category: a positive uncategorized amount reads as income, a negative one as spend.
-function classifyTxnKind(t) {
-  const cat = t.category || "";
-  if (cat.startsWith("TRANSFER:")) return "transfer";
-  if (cat.startsWith("EXCLUDE:") || cat.startsWith("REVIEW:")) return "excluded";
+// --- Sign-resilient category classification (Dashboard Overhaul + Customizable Category Behaviors) --
+// Classifies a transaction into "income" | "expense" | "neutral" using each category's configured
+// *behavior* (see the categoryBehaviors state below and Settings > Spending Categories > Behavior
+// dropdown) rather than a fixed prefix rule or raw amount sign alone - a person can mark any category
+// Income/Expense/Neutral (Excluded) regardless of what it's named, so an income row saved with the
+// wrong sign, or a transfer that was never really spend to begin with, doesn't quietly distort the
+// Dashboard's totals. A category with no explicit entry in categoryBehaviors - nothing set yet, a
+// system category nobody's touched the dropdown for, or a payload saved before this feature existed -
+// falls back to defaultCategoryBehavior's prefix-based guess, so this is fully backwards compatible
+// with every browser's already-saved data. Amount sign only gets the final word for a genuinely
+// uncategorized row, since "no category yet" isn't itself a category: a positive uncategorized amount
+// reads as income, a negative one as spend.
+const VALID_BEHAVIORS = new Set(["income", "expense", "neutral"]);
+// Shared option list for every Behavior <select> in Settings (existing categories + the add-category
+// form), so the three choices and their labels only need to be written once.
+const BEHAVIOR_OPTIONS = [
+  { value: "expense", label: "Expense" },
+  { value: "income", label: "Income" },
+  { value: "neutral", label: "Neutral (Excluded)" },
+];
+function defaultCategoryBehavior(catName) {
+  const cat = catName || "";
   if (cat.startsWith("INCOME:")) return "income";
-  if (!t.category) return t.amount > 0 ? "income" : "expense";
+  if (cat.startsWith("TRANSFER:") || cat.startsWith("EXCLUDE:") || cat.startsWith("REVIEW:")) return "neutral";
   return "expense";
+}
+function classifyTxnKind(t, categoryBehaviors) {
+  const cat = t.category || "";
+  if (!cat) return t.amount > 0 ? "income" : "expense";
+  const configured = categoryBehaviors && categoryBehaviors[cat];
+  return VALID_BEHAVIORS.has(configured) ? configured : defaultCategoryBehavior(cat);
 }
 // Always non-negative magnitudes built on classifyTxnKind, so a caller summing them never needs to
 // remember which raw sign convention a given category happens to use.
-function txnIncomeAmount(t) { return classifyTxnKind(t) === "income" ? Math.abs(t.amount) : 0; }
-function txnExpenseAmount(t) { return classifyTxnKind(t) === "expense" ? Math.abs(t.amount) : 0; }
+function txnIncomeAmount(t, categoryBehaviors) { return classifyTxnKind(t, categoryBehaviors) === "income" ? Math.abs(t.amount) : 0; }
+function txnExpenseAmount(t, categoryBehaviors) { return classifyTxnKind(t, categoryBehaviors) === "expense" ? Math.abs(t.amount) : 0; }
 
 // --- v4.1 one-time data migration: fold the old "TRANSFER: Wealthsimple" category forward into the
 // new "Investing" spending category, wherever ledger data gets loaded from. Three small, independent
@@ -261,7 +279,7 @@ const STORAGE_KEY = "ledger:autosave:v1";
 let _persistedCache = null;
 function readPersistedStore() {
   if (_persistedCache) return _persistedCache;
-  _persistedCache = { transactions: null, lookup: null, spendingCategories: null, budget: null, recurringConfig: null, dashboardLayout: null };
+  _persistedCache = { transactions: null, lookup: null, spendingCategories: null, budget: null, recurringConfig: null, dashboardLayout: null, categoryBehaviors: null };
   try {
     if (typeof window === "undefined" || !window.localStorage) return _persistedCache;
     const raw = window.localStorage.getItem(STORAGE_KEY);
@@ -286,6 +304,9 @@ function readPersistedStore() {
     }
     if (parsed.dashboardLayout && isValidDashboardLayout(parsed.dashboardLayout)) {
       _persistedCache.dashboardLayout = normalizeDashboardLayout(parsed.dashboardLayout);
+    }
+    if (parsed.categoryBehaviors && isValidCategoryBehaviors(parsed.categoryBehaviors)) {
+      _persistedCache.categoryBehaviors = parsed.categoryBehaviors;
     }
   } catch (err) {
     console.warn("Ledger: couldn't read saved data from this browser - starting from empty state.", err);
@@ -337,11 +358,24 @@ function baseMerchantName(text) {
   return normalize(idx === -1 ? raw : raw.slice(0, idx));
 }
 
+// Merchant-matching half of the duplicate test, shared by looksLikeDuplicateOf (staging, exact-date)
+// and findDuplicateClusters (retroactive log scan, ±1 day) below - a match by exact normalized text,
+// substring containment either direction, or a shared "base" name across a " - " location/branch
+// suffix (see baseMerchantName).
+function merchantsLikelyMatch(rawA, rawB) {
+  const a = normalize(rawA);
+  const b = normalize(rawB);
+  if (!a || !b) return false;
+  if (a === b) return true; // exact match
+  if (a.includes(b) || b.includes(a)) return true; // substring match, either direction
+  const baseA = baseMerchantName(rawA);
+  return !!baseA && baseA === baseMerchantName(rawB); // split match on " - "
+}
+
 // Looser duplicate test than fingerprint()'s exact match, used by CSV/paste staging to FLAG (not
 // silently exclude) a row that's likely already in the log: same date, same magnitude - Math.abs, so
 // a row imported once normally and once with an inverted sign (see the Credit Card mode toggle)
-// still gets caught - and a merchant match by exact text, substring containment either direction, or
-// shared base name across a " - " location/branch suffix (see baseMerchantName). Deliberately more
+// still gets caught - and a merchant match via merchantsLikelyMatch above. Deliberately more
 // permissive than fingerprint's exact-string dedup, which stays strict enough to safely auto-exclude
 // a row without a person ever seeing it; this one only ever suggests, via a badge the person can
 // override by checking the row back in (see stageRows/commitStaging).
@@ -349,17 +383,56 @@ function looksLikeDuplicateOf(row, existing) {
   if (row.date !== existing.date) return false;
   if (!Number.isFinite(row.amount) || !Number.isFinite(existing.amount)) return false;
   if (Math.abs(row.amount).toFixed(2) !== Math.abs(existing.amount).toFixed(2)) return false;
+  return merchantsLikelyMatch(row.merchant || row.description || "", existing.merchant || existing.description || "");
+}
 
-  const rowRaw = row.merchant || row.description || "";
-  const existingRaw = existing.merchant || existing.description || "";
-  const a = normalize(rowRaw);
-  const b = normalize(existingRaw);
-  if (!a || !b) return false;
-  if (a === b) return true; // exact match
-  if (a.includes(b) || b.includes(a)) return true; // substring match, either direction
+// --- Retroactive "Scan for Duplicates" (Transaction Log) ---------------------------------------
+// Unlike looksLikeDuplicateOf above (exact date match, used while staging a fresh import against the
+// already-committed log), a retroactive scan across the log itself allows a ±1 day date drift too - a
+// duplicate that slipped in from two overlapping statement exports often lands one calendar day apart
+// (a weekend posting delay, a timezone cutoff at the bank), and by the time it's already sitting in
+// the log there's no "which one is the new import" asymmetry left to lean on the way staging has.
+function daysBetween(dateA, dateB) {
+  const a = Date.parse(`${dateA}T00:00:00Z`);
+  const b = Date.parse(`${dateB}T00:00:00Z`);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return Infinity;
+  return Math.abs(a - b) / 86400000;
+}
+function looksLikeDuplicatePair(a, b) {
+  if (!Number.isFinite(a.amount) || !Number.isFinite(b.amount)) return false;
+  if (Math.abs(a.amount).toFixed(2) !== Math.abs(b.amount).toFixed(2)) return false;
+  if (daysBetween(a.date, b.date) > 1) return false;
+  return merchantsLikelyMatch(a.merchant || a.description || "", b.merchant || b.description || "");
+}
 
-  const baseA = baseMerchantName(rowRaw);
-  return !!baseA && baseA === baseMerchantName(existingRaw); // split match on " - "
+// Groups the full transaction log into clusters of likely duplicates (2+ transactions each). Each
+// transaction is compared only against the first (lowest-id, i.e. earliest-added) unclustered
+// transaction it's checked against - the "anchor" - rather than computed as a full transitive
+// closure, so a cluster's membership stays predictable and doesn't balloon through a long chain of
+// loosely-related merchant strings. O(n^2) comparisons is fine at personal-finance-history scale
+// (thousands of rows, not millions). Within a cluster, transactions are sorted lowest-id-first so the
+// caller can treat index 0 as the original entry to keep by default.
+function findDuplicateClusters(transactions) {
+  const relevant = transactions
+    .filter(t => Number.isFinite(t.amount) && (t.merchant || t.description))
+    .sort((a, b) => a.id - b.id);
+  const used = new Set();
+  const clusters = [];
+  for (let i = 0; i < relevant.length; i++) {
+    const anchor = relevant[i];
+    if (used.has(anchor.id)) continue;
+    const group = [anchor];
+    for (let j = i + 1; j < relevant.length; j++) {
+      const candidate = relevant[j];
+      if (used.has(candidate.id)) continue;
+      if (looksLikeDuplicatePair(anchor, candidate)) group.push(candidate);
+    }
+    if (group.length > 1) {
+      group.forEach(g => used.add(g.id));
+      clusters.push(group);
+    }
+  }
+  return clusters;
 }
 
 const MAX_IMPORT_BYTES = 25 * 1024 * 1024;
@@ -1061,6 +1134,17 @@ function isValidDashboardLayoutEntry(item) {
 function isValidDashboardLayout(l) {
   return Array.isArray(l) && l.every(isValidDashboardLayoutEntry);
 }
+
+// categoryBehaviors (Customizable Category Behaviors, Settings > Spending Categories) is a plain
+// { [categoryName]: "income" | "expense" | "neutral" } map, sparse by design - only categories a
+// person has actually touched the Behavior dropdown for get an entry (see classifyTxnKind's
+// defaultCategoryBehavior fallback above for everything else). A key with an unrecognized value is
+// enough to reject the whole map, same "validate before applying anything" rule every other saved-
+// data shape in this file follows.
+function isValidCategoryBehaviors(obj) {
+  return !!obj && typeof obj === "object" && !Array.isArray(obj)
+    && Object.values(obj).every(v => VALID_BEHAVIORS.has(v));
+}
 // Repairs a saved layout against the app's current section vocabulary: drops any id the app no
 // longer recognizes, dedups (first occurrence wins), and appends any section the app knows about but
 // the saved layout doesn't mention (a newer app version added it, or it was never saved) as visible
@@ -1588,6 +1672,76 @@ function DeleteAllConfirmModal({ count, onConfirm, onCancel }) {
         <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
           <button style={btn} onClick={onCancel}>Cancel</button>
           <button style={btnDanger} onClick={onConfirm}><Trash2 size={14} /> Delete all {count}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Retroactive "Scan Duplicates" (Transaction Log action bar) - review UI for findDuplicateClusters'
+// output. Each cluster renders as its own side-by-side comparison card; every row in a cluster
+// defaults to a Keep/Delete state (the earliest-added transaction - clusters are pre-sorted lowest-id-
+// first by findDuplicateClusters - keeps by default, everything else after it in the cluster is
+// pre-selected for deletion) that a person can flip per row before committing. `selected` tracks ids
+// marked for DELETION, not ids kept, so the common case (accept the defaults) needs zero clicks.
+function DuplicateCleanerModal({ clusters, onConfirm, onCancel }) {
+  const [selected, setSelected] = useState(() => {
+    const s = new Set();
+    clusters.forEach(group => group.slice(1).forEach(t => s.add(t.id)));
+    return s;
+  });
+  function toggle(id) {
+    setSelected(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+  const totalFlagged = clusters.reduce((sum, group) => sum + group.length, 0);
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 9999, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center", padding: "20px" }}>
+      <div style={{ ...card, maxWidth: "720px", width: "100%", maxHeight: "85vh", display: "flex", flexDirection: "column" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "6px" }}>
+          <ScanSearch size={18} color="var(--text-accent)" />
+          <div style={{ fontSize: "15px", fontWeight: 600 }}>Duplicate Cleaner</div>
+        </div>
+        <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 14px" }}>
+          Found {clusters.length} cluster{clusters.length !== 1 ? "s" : ""} ({totalFlagged} transactions) with a matching amount, a date within a day of each other, and matching or overlapping merchant text. The earliest entry in each cluster is kept by default - toggle any row to change what gets deleted.
+        </p>
+        <div style={{ overflowY: "auto", flex: 1, display: "flex", flexDirection: "column", gap: "12px", marginBottom: "14px" }}>
+          {clusters.map((group, i) => (
+            <div key={group[0].id} style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: "10px 12px" }}>
+              <div style={{ fontSize: "11px", color: "var(--text-muted)", marginBottom: "6px" }}>Cluster {i + 1} - {group.length} transactions</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                {group.map(t => {
+                  const markedForDelete = selected.has(t.id);
+                  return (
+                    <div key={t.id} style={{ display: "flex", alignItems: "center", gap: "10px", fontSize: "12.5px", padding: "6px 8px", borderRadius: "6px", background: markedForDelete ? "var(--bg-danger)" : "var(--bg-success)" }}>
+                      <span style={{ width: "80px", flexShrink: 0, color: "var(--text-muted)" }}>{t.date}</span>
+                      <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.merchant || t.description || "(no merchant)"}</span>
+                      <span style={{ width: "70px", textAlign: "right", flexShrink: 0, fontVariantNumeric: "tabular-nums" }}>{t.amount < 0 ? "-" : "+"}${Math.abs(t.amount).toFixed(2)}</span>
+                      <AccountBadge account={t.account} />
+                      <button
+                        style={{ ...btn, padding: "4px 10px", width: "64px", flexShrink: 0, justifyContent: "center", color: markedForDelete ? "var(--text-danger)" : "var(--text-success)", borderColor: markedForDelete ? "var(--border-danger)" : "var(--text-success)" }}
+                        onClick={() => toggle(t.id)}
+                      >
+                        {markedForDelete ? "Delete" : "Keep"}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", flexWrap: "wrap", borderTop: "1px solid var(--border)", paddingTop: "12px" }}>
+          <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>{selected.size} of {totalFlagged} selected for deletion</span>
+          <div style={{ display: "flex", gap: "8px" }}>
+            <button style={btn} onClick={onCancel}>Cancel</button>
+            <button style={{ ...btnDanger, opacity: selected.size ? 1 : 0.5 }} disabled={selected.size === 0} onClick={() => onConfirm([...selected])}>
+              <Trash2 size={14} /> Delete {selected.size} selected duplicate{selected.size !== 1 ? "s" : ""}
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -2231,6 +2385,10 @@ export default function Ledger() {
   const [transactions, setTransactions] = useState(() => persisted.transactions || []);
   const [lookup, setLookup] = useState(() => persisted.lookup || []);
   const [spendingCategories, setSpendingCategories] = useState(() => persisted.spendingCategories || DEFAULT_SPENDING_CATEGORIES);
+  // Per-category income/expense/neutral override (Settings > Spending Categories > Behavior dropdown).
+  // Sparse map - see isValidCategoryBehaviors/defaultCategoryBehavior above for how an absent entry
+  // resolves. Persisted, exported/imported, and cloud-synced alongside spendingCategories.
+  const [categoryBehaviors, setCategoryBehaviors] = useState(() => persisted.categoryBehaviors || {});
   const [tab, setTab] = useState("log");
   // Falls back to the OS-level preference on a first visit (no saved choice yet), then remembers
   // whatever the person picks from here on, independent of that OS preference.
@@ -2654,7 +2812,7 @@ export default function Ledger() {
     const providerLabel = cloudProvider === "dropbox" ? "Dropbox" : "Google Drive";
     try {
       setCloudStatus("encrypting"); setCloudStatusMessage("Encrypting your data...");
-      const payload = { transactions, lookup, spendingCategories, budget, recurringConfig, dashboardLayout, exportedAt: new Date().toISOString() };
+      const payload = { transactions, lookup, spendingCategories, categoryBehaviors, budget, recurringConfig, dashboardLayout, exportedAt: new Date().toISOString() };
       const envelopeText = await encryptVaultPayload(cloudPassphrase, payload);
       setCloudStatus("syncing"); setCloudStatusMessage(`Uploading to ${providerLabel}...`);
       if (cloudProvider === "dropbox") {
@@ -2715,6 +2873,7 @@ export default function Ledger() {
 
       const hasT = "transactions" in payload, hasL = "lookup" in payload, hasB = "budget" in payload;
       const hasC = "spendingCategories" in payload, hasRC = "recurringConfig" in payload, hasDL = "dashboardLayout" in payload;
+      const hasCB = "categoryBehaviors" in payload;
       if (hasT && (!Array.isArray(payload.transactions) || payload.transactions.length > MAX_IMPORT_ROWS || !payload.transactions.every(isValidTransaction))) {
         throw new Error("The transactions in the cloud backup look malformed. Nothing was imported - your local data is unchanged.");
       }
@@ -2733,9 +2892,12 @@ export default function Ledger() {
       if (hasDL && !isValidDashboardLayout(payload.dashboardLayout)) {
         throw new Error("The dashboard layout settings in the cloud backup look malformed. Nothing was imported - your local data is unchanged.");
       }
+      if (hasCB && !isValidCategoryBehaviors(payload.categoryBehaviors)) {
+        throw new Error("The category behavior settings in the cloud backup look malformed. Nothing was imported - your local data is unchanged.");
+      }
 
       // All validated - apply as one batch, same as importData.
-      if (hasT || hasL || hasB || hasC || hasRC || hasDL) suppressDirtyCheck.current = true;
+      if (hasT || hasL || hasB || hasC || hasRC || hasDL || hasCB) suppressDirtyCheck.current = true;
       if (hasT) {
         const reindexed = migrateWealthsimpleTransactions(payload.transactions.map((t, i) => ({ ...t, id: i })));
         setTransactions(reindexed);
@@ -2748,6 +2910,7 @@ export default function Ledger() {
       if (hasC) setSpendingCategories(ensureMasterSeedCategories(ensureWealthsimpleCategory(payload.spendingCategories)));
       if (hasRC) setRecurringConfig(payload.recurringConfig);
       if (hasDL) setDashboardLayout(normalizeDashboardLayout(payload.dashboardLayout));
+      if (hasCB) setCategoryBehaviors(payload.categoryBehaviors);
       setHasUnsavedChanges(false);
 
       markCloudSynced(cloudProvider);
@@ -2765,13 +2928,13 @@ export default function Ledger() {
   useEffect(() => {
     try {
       if (typeof window === "undefined" || !window.localStorage) return;
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ transactions, lookup, spendingCategories, budget, recurringConfig, dashboardLayout }));
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ transactions, lookup, spendingCategories, categoryBehaviors, budget, recurringConfig, dashboardLayout }));
       setStorageWarning("");
     } catch (err) {
       console.warn("Ledger: couldn't save to this browser's storage.", err);
       setStorageWarning("Changes aren't saving to this browser right now (storage may be full or blocked). Use Save backup below so nothing is lost.");
     }
-  }, [transactions, lookup, spendingCategories, budget, recurringConfig, dashboardLayout]);
+  }, [transactions, lookup, spendingCategories, categoryBehaviors, budget, recurringConfig, dashboardLayout]);
 
   // Persists the theme choice separately from the financial-data autosave above, so it's never part
   // of a JSON export/import - loading a backup on a different device shouldn't flip that device's
@@ -3154,10 +3317,15 @@ export default function Ledger() {
   }
 
   // --- Category management ---
-  function addCategory(name) {
+  // `behavior` defaults to "expense" so a category added without ever touching the Behavior dropdown
+  // (e.g. programmatically, or from a form that predates this feature) lands on exactly what
+  // defaultCategoryBehavior would already have guessed for a plain, unprefixed name - explicit rather
+  // than relying on the sparse-map fallback, so what's shown in Settings always matches what's stored.
+  function addCategory(name, behavior) {
     const trimmed = name.trim();
     if (!trimmed || allCategories.includes(trimmed)) return false;
     setSpendingCategories(prev => [...prev, trimmed]);
+    setCategoryBehaviors(prev => ({ ...prev, [trimmed]: VALID_BEHAVIORS.has(behavior) ? behavior : "expense" }));
     return true;
   }
   function renameCategory(oldName, newName) {
@@ -3166,6 +3334,13 @@ export default function Ledger() {
     setSpendingCategories(prev => prev.map(c => c === oldName ? trimmed : c));
     setTransactions(prev => prev.map(t => t.category === oldName ? { ...t, category: trimmed } : t));
     setLookup(prev => prev.map(([k, c]) => c === oldName ? [k, trimmed] : [k, c]));
+    // Carries the old name's configured behavior forward under the new name, rather than losing it
+    // back to defaultCategoryBehavior's guess for whatever the new name happens to look like.
+    setCategoryBehaviors(prev => {
+      if (!(oldName in prev)) return prev;
+      const { [oldName]: behavior, ...rest } = prev;
+      return { ...rest, [trimmed]: behavior };
+    });
     return true;
   }
   function removeCategory(name) {
@@ -3177,6 +3352,19 @@ export default function Ledger() {
     setSpendingCategories(prev => prev.filter(c => c !== name));
     setTransactions(prev => prev.map(t => t.category === name ? { ...t, category: "REVIEW: Ambiguous" } : t));
     setLookup(prev => prev.filter(([, c]) => c !== name));
+    setCategoryBehaviors(prev => {
+      if (!(name in prev)) return prev;
+      const next = { ...prev };
+      delete next[name];
+      return next;
+    });
+  }
+  // Sets (or clears back to the default guess by passing an invalid value) one category's configured
+  // behavior - the Behavior dropdown's onChange handler, for both existing categories and any category
+  // whose name doesn't match the INCOME:/TRANSFER:/EXCLUDE: convention defaultCategoryBehavior expects.
+  function setCategoryBehavior(name, behavior) {
+    if (!VALID_BEHAVIORS.has(behavior)) return;
+    setCategoryBehaviors(prev => ({ ...prev, [name]: behavior }));
   }
 
   // --- Committed cost management ---
@@ -3314,7 +3502,7 @@ export default function Ledger() {
   }
 
   function exportData() {
-    const payload = { transactions, lookup, budget, spendingCategories, recurringConfig, dashboardLayout, exportedAt: new Date().toISOString() };
+    const payload = { transactions, lookup, budget, spendingCategories, categoryBehaviors, recurringConfig, dashboardLayout, exportedAt: new Date().toISOString() };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -3346,6 +3534,7 @@ export default function Ledger() {
       const hasC = "spendingCategories" in payload;
       const hasRC = "recurringConfig" in payload;
       const hasDL = "dashboardLayout" in payload;
+      const hasCB = "categoryBehaviors" in payload;
 
       // Validate everything present BEFORE applying anything - a backup with one bad section
       // should never partially overwrite good data in another section.
@@ -3373,12 +3562,16 @@ export default function Ledger() {
         alert("The dashboard layout settings in that file look malformed. Nothing was imported - your current data is unchanged.");
         return;
       }
+      if (hasCB && !isValidCategoryBehaviors(payload.categoryBehaviors)) {
+        alert("The category behavior settings in that file look malformed. Nothing was imported - your current data is unchanged.");
+        return;
+      }
 
       // All validated - apply as one batch, and suppress the dirty-tracking effect for the render
       // this causes, so a freshly loaded backup doesn't immediately show as "unsaved changes."
       // Only arm the suppression if something will actually change - an empty-but-valid payload
       // (e.g. {}) would otherwise leave the flag stuck and incorrectly swallow the NEXT real edit.
-      if (hasT || hasL || hasB || hasC || hasRC || hasDL) suppressDirtyCheck.current = true;
+      if (hasT || hasL || hasB || hasC || hasRC || hasDL || hasCB) suppressDirtyCheck.current = true;
       if (hasT) {
         const reindexed = migrateWealthsimpleTransactions(payload.transactions.map((t, i) => ({ ...t, id: i })));
         setTransactions(reindexed);
@@ -3394,6 +3587,7 @@ export default function Ledger() {
       if (hasC) setSpendingCategories(ensureMasterSeedCategories(ensureWealthsimpleCategory(payload.spendingCategories)));
       if (hasRC) setRecurringConfig(payload.recurringConfig);
       if (hasDL) setDashboardLayout(normalizeDashboardLayout(payload.dashboardLayout));
+      if (hasCB) setCategoryBehaviors(payload.categoryBehaviors);
       setHasUnsavedChanges(false);
     };
     reader.readAsText(file);
@@ -3452,15 +3646,15 @@ export default function Ledger() {
   );
 
   // --- Widget 1: High-level KPI summary grid -----------------------------------------------------
-  const dashTotalEarned = useMemo(() => dashWindowTxns.reduce((s, t) => s + txnIncomeAmount(t), 0), [dashWindowTxns]);
-  const dashTotalSpent = useMemo(() => dashWindowTxns.reduce((s, t) => s + txnExpenseAmount(t), 0), [dashWindowTxns]);
+  const dashTotalEarned = useMemo(() => dashWindowTxns.reduce((s, t) => s + txnIncomeAmount(t, categoryBehaviors), 0), [dashWindowTxns, categoryBehaviors]);
+  const dashTotalSpent = useMemo(() => dashWindowTxns.reduce((s, t) => s + txnExpenseAmount(t, categoryBehaviors), 0), [dashWindowTxns, categoryBehaviors]);
   const dashNetSavings = dashTotalEarned - dashTotalSpent;
   const dashSavingsRatePct = dashTotalEarned > 0 ? (dashNetSavings / dashTotalEarned) * 100 : null;
   const dashWindowDays = Math.max(1, Math.round((new Date(`${dashWindow.to}T00:00:00`) - new Date(`${dashWindow.from}T00:00:00`)) / 86400000) + 1);
   const dashAvgDailySpend = dashTotalSpent / dashWindowDays;
 
-  const dashPrevTotalEarned = useMemo(() => dashPrevWindowTxns.reduce((s, t) => s + txnIncomeAmount(t), 0), [dashPrevWindowTxns]);
-  const dashPrevTotalSpent = useMemo(() => dashPrevWindowTxns.reduce((s, t) => s + txnExpenseAmount(t), 0), [dashPrevWindowTxns]);
+  const dashPrevTotalEarned = useMemo(() => dashPrevWindowTxns.reduce((s, t) => s + txnIncomeAmount(t, categoryBehaviors), 0), [dashPrevWindowTxns, categoryBehaviors]);
+  const dashPrevTotalSpent = useMemo(() => dashPrevWindowTxns.reduce((s, t) => s + txnExpenseAmount(t, categoryBehaviors), 0), [dashPrevWindowTxns, categoryBehaviors]);
   const dashPrevWindowDays = Math.max(1, Math.round((new Date(`${dashPrevWindow.to}T00:00:00`) - new Date(`${dashPrevWindow.from}T00:00:00`)) / 86400000) + 1);
   const dashPrevAvgDailySpend = dashPrevTotalSpent / dashPrevWindowDays;
 
@@ -3479,7 +3673,7 @@ export default function Ledger() {
     const byMonth = new Map();
     dashWindowTxns.forEach(t => {
       const m = t.date.slice(0, 7);
-      const kind = classifyTxnKind(t);
+      const kind = classifyTxnKind(t, categoryBehaviors);
       if (kind !== "income" && kind !== "expense") return;
       const bucket = byMonth.get(m) || { month: m, income: 0, expense: 0 };
       if (kind === "income") bucket.income += Math.abs(t.amount); else bucket.expense += Math.abs(t.amount);
@@ -3492,13 +3686,13 @@ export default function Ledger() {
       net: Math.round(m.income - m.expense),
       savingsRate: m.income > 0 ? Math.round(((m.income - m.expense) / m.income) * 1000) / 10 : null,
     }));
-  }, [dashWindowTxns]);
+  }, [dashWindowTxns, categoryBehaviors]);
 
   // --- Widget 3: Category spending breakdown & ranking -----------------------------------------
   const dashCategoryRanking = useMemo(() => {
     const totals = freshTally();
     dashWindowTxns.forEach(t => {
-      if (classifyTxnKind(t) !== "expense") return;
+      if (classifyTxnKind(t, categoryBehaviors) !== "expense") return;
       const cat = t.category || "Uncategorized";
       totals[cat] = (totals[cat] || 0) + Math.abs(t.amount);
     });
@@ -3507,7 +3701,7 @@ export default function Ledger() {
     return entries.map(([category, total]) => ({
       category, total: Math.round(total), pct: sum > 0 ? (total / sum) * 100 : 0,
     })).sort((a, b) => b.total - a.total);
-  }, [dashWindowTxns]);
+  }, [dashWindowTxns, categoryBehaviors]);
   const dashCategoryRankingTotal = dashCategoryRanking.reduce((s, c) => s + c.total, 0);
 
   // Top-5 merchant contributors for one category, computed on demand when a ranking bar is expanded
@@ -3515,7 +3709,7 @@ export default function Ledger() {
   function dashCategoryTopMerchants(category) {
     const totals = freshTally();
     dashWindowTxns.forEach(t => {
-      if (classifyTxnKind(t) !== "expense") return;
+      if (classifyTxnKind(t, categoryBehaviors) !== "expense") return;
       if ((t.category || "Uncategorized") !== category) return;
       const m = t.merchant || "(no merchant)";
       totals[m] = (totals[m] || 0) + Math.abs(t.amount);
@@ -3536,7 +3730,7 @@ export default function Ledger() {
     let fixed = 0, discretionary = 0;
     const fixedByMerchant = freshTally(), discByCategory = freshTally();
     dashWindowTxns.forEach(t => {
-      if (classifyTxnKind(t) !== "expense") return;
+      if (classifyTxnKind(t, categoryBehaviors) !== "expense") return;
       const amt = Math.abs(t.amount);
       if (dashFixedMerchants.has(t.merchant)) {
         fixed += amt;
@@ -3550,7 +3744,7 @@ export default function Ledger() {
     const topFixed = Object.entries(fixedByMerchant).map(([merchant, total]) => ({ merchant, total: Math.round(total) })).sort((a, b) => b.total - a.total).slice(0, 5);
     const topDiscretionary = Object.entries(discByCategory).map(([category, total]) => ({ category, total: Math.round(total) })).sort((a, b) => b.total - a.total).slice(0, 5);
     return { fixed: Math.round(fixed), discretionary: Math.round(discretionary), topFixed, topDiscretionary };
-  }, [dashWindowTxns, dashFixedMerchants]);
+  }, [dashWindowTxns, dashFixedMerchants, categoryBehaviors]);
 
   const dashboardTxns = useMemo(() => {
     let rows = transactions;
@@ -3845,6 +4039,21 @@ export default function Ledger() {
   const [selectedTxnIds, setSelectedTxnIds] = useState(() => new Set());
   const [bulkCategory, setBulkCategory] = useState("");
   const [showDeleteAllModal, setShowDeleteAllModal] = useState(false);
+  // Retroactive "Scan Duplicates" (see findDuplicateClusters) - null/closed until a scan is run,
+  // then holds the cluster list DuplicateCleanerModal reviews. Recomputed fresh from `transactions`
+  // each time the button is clicked rather than kept live via useMemo, since this is an on-demand
+  // audit action, not something that needs to track every edit while the modal is closed.
+  const [duplicateClusters, setDuplicateClusters] = useState(null);
+  // Lightweight self-dismissing toast for non-blocking confirmations (e.g. "3 duplicates deleted") -
+  // every other piece of feedback in this app is either a blocking alert()/confirm() or an inline
+  // status message, so this is a small, self-contained addition rather than a shared library.
+  const [toastMessage, setToastMessage] = useState("");
+  const toastTimer = useRef(null);
+  function showToast(message) {
+    setToastMessage(message);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToastMessage(""), 3200);
+  }
 
   function toggleTxnSelected(id) {
     setSelectedTxnIds(prev => {
@@ -3931,6 +4140,40 @@ export default function Ledger() {
     setSelectedTxnIds(new Set());
     setLastImportBatch(null);
     setShowDeleteAllModal(false);
+  }
+
+  // "Scan Duplicates" button - runs findDuplicateClusters against the full log and opens
+  // DuplicateCleanerModal with the result, or tells the person nothing was found rather than opening
+  // an empty modal.
+  function openDuplicateScanner() {
+    const clusters = findDuplicateClusters(transactions);
+    if (clusters.length === 0) {
+      alert("No likely duplicates found - every transaction's amount, date, and merchant combination looks unique.");
+      return;
+    }
+    setDuplicateClusters(clusters);
+  }
+  // Applies DuplicateCleanerModal's confirmed selection: removes the chosen ids from the permanent
+  // log (same shape as deleteSelectedTxns), keeps the bulk-selection/editing/splitting state
+  // consistent with whatever just got deleted, closes the modal, and surfaces a toast rather than
+  // another blocking alert() on top of the confirm() the modal's own delete button already required.
+  function deleteDuplicates(idsToDelete) {
+    const count = idsToDelete.length;
+    if (count === 0) return;
+    const ok = confirm(`Delete ${count} duplicate transaction${count !== 1 ? "s" : ""}? This can't be undone.`);
+    if (!ok) return;
+    const idSet = new Set(idsToDelete);
+    if (editingTxnId !== null && idSet.has(editingTxnId)) { setEditingTxnId(null); setEditDraft(null); }
+    if (splittingTxnId !== null && idSet.has(splittingTxnId)) setSplittingTxnId(null);
+    setTransactions(prev => prev.filter(t => !idSet.has(t.id)));
+    setSelectedTxnIds(prev => {
+      if (![...idSet].some(id => prev.has(id))) return prev;
+      const next = new Set(prev);
+      idSet.forEach(id => next.delete(id));
+      return next;
+    });
+    setDuplicateClusters(null);
+    showToast(`${count} duplicate${count !== 1 ? "s" : ""} deleted.`);
   }
 
   // Sets dateFrom/dateTo to the first/last day of the chosen YYYY-MM month in one step, as a
@@ -4542,6 +4785,11 @@ export default function Ledger() {
                 <input type="date" value={dateTo} onChange={e => { setDateTo(e.target.value); setQuickMonth(""); }} style={{ ...input, width: "140px" }} />
                 {(dateFrom || dateTo) && <button style={{ ...btn, padding: "4px 10px" }} onClick={() => { setDateFrom(""); setDateTo(""); setQuickMonth(""); }}>Clear dates</button>}
                 {transactions.length > 0 && (
+                  <button style={{ ...btn, padding: "4px 10px" }} onClick={openDuplicateScanner}>
+                    <ScanSearch size={13} /> Scan Duplicates
+                  </button>
+                )}
+                {transactions.length > 0 && (
                   <button style={{ ...btn, padding: "4px 10px", color: "var(--text-danger)", borderColor: "var(--border-danger)" }}
                     onClick={() => setShowDeleteAllModal(true)}>
                     <Trash2 size={13} /> Delete all ({transactions.length})
@@ -4551,6 +4799,9 @@ export default function Ledger() {
             </div>
             {showDeleteAllModal && (
               <DeleteAllConfirmModal count={transactions.length} onConfirm={deleteAllTransactions} onCancel={() => setShowDeleteAllModal(false)} />
+            )}
+            {duplicateClusters && (
+              <DuplicateCleanerModal clusters={duplicateClusters} onConfirm={deleteDuplicates} onCancel={() => setDuplicateClusters(null)} />
             )}
             {selectedTxnIds.size > 0 && (
               <div style={{ position: "sticky", top: 0, zIndex: 5, ...card, background: "var(--bg-accent)", borderColor: "var(--text-accent)", padding: "10px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px", flexWrap: "wrap", marginBottom: "10px" }}>
@@ -5010,6 +5261,7 @@ export default function Ledger() {
 
       {tab === "settings" && <SettingsTab
         spendingCategories={spendingCategories} addCategory={addCategory} renameCategory={renameCategory} removeCategory={removeCategory}
+        categoryBehaviors={categoryBehaviors} setCategoryBehavior={setCategoryBehavior}
         lookup={lookup} allCategories={allCategories} addLookupRule={addLookupRule} updateLookupRuleCategory={updateLookupRuleCategory} removeLookupRule={removeLookupRule}
         recurringConfig={recurringConfig} updateRecurringConfig={updateRecurringConfig} resetRecurringConfig={resetRecurringConfig}
         lockEnabled={lockEnabled} onToggleLockEnabled={handleToggleLockEnabled}
@@ -5026,6 +5278,11 @@ export default function Ledger() {
         onConnectDropbox={connectDropbox} onDisconnectDropbox={disconnectDropbox}
         onSyncNowToCloud={syncNowToCloud} onPullFromCloud={pullFromCloud}
       />}
+      {toastMessage && (
+        <div className="ledger-no-print" style={{ position: "fixed", left: "50%", bottom: "24px", transform: "translateX(-50%)", zIndex: 10000, background: "var(--text-primary)", color: "var(--surface-1)", fontSize: "13px", fontWeight: 500, padding: "10px 18px", borderRadius: "var(--radius)", boxShadow: "0 6px 20px rgba(0,0,0,0.25)" }}>
+          {toastMessage}
+        </div>
+      )}
     </div>
   );
 }
@@ -5103,7 +5360,7 @@ async function clearCacheAndHardReset() {
 }
 
 function SettingsTab({
-  spendingCategories, addCategory, renameCategory, removeCategory, lookup, allCategories, addLookupRule, updateLookupRuleCategory, removeLookupRule,
+  spendingCategories, addCategory, renameCategory, removeCategory, categoryBehaviors, setCategoryBehavior, lookup, allCategories, addLookupRule, updateLookupRuleCategory, removeLookupRule,
   recurringConfig, updateRecurringConfig, resetRecurringConfig,
   lockEnabled, onToggleLockEnabled, hasPin, onSetPin, onRemovePin, hasBiometrics, onEnableBiometrics, onRemoveBiometrics,
   cloudProvider, setCloudProvider, cloudClientId, setCloudClientId, dropboxAppKey, setDropboxAppKey,
@@ -5111,6 +5368,7 @@ function SettingsTab({
   onConnectGoogle, onDisconnectGoogle, onConnectDropbox, onDisconnectDropbox, onSyncNowToCloud, onPullFromCloud,
 }) {
   const [newCat, setNewCat] = useState("");
+  const [newCatBehavior, setNewCatBehavior] = useState("expense");
   const [editingCat, setEditingCat] = useState(null);
   const [editingCatValue, setEditingCatValue] = useState("");
   const [ruleSearch, setRuleSearch] = useState("");
@@ -5135,11 +5393,14 @@ function SettingsTab({
 
       <div style={card}>
         <div style={{ ...label, marginBottom: "10px" }}>Manage categories</div>
-        <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 12px" }}>These are the spending categories offered in every dropdown. System categories (Income, Transfers, Review) aren't shown here since removing them would break the math elsewhere.</p>
-        <div style={{ display: "flex", gap: "8px", marginBottom: "14px" }}>
-          <input value={newCat} onChange={e => setNewCat(e.target.value)} placeholder="New category name" style={{ ...input, flex: 1 }}
-            onKeyDown={e => { if (e.key === "Enter" && addCategory(newCat)) setNewCat(""); }} />
-          <button style={btnPrimary} onClick={() => { if (addCategory(newCat)) setNewCat(""); }}><Plus size={14} /> Add</button>
+        <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 12px" }}>These are the spending categories offered in every dropdown. System categories (Income, Transfers, Review) aren't shown here since removing them would break the math elsewhere. Behavior controls how the Dashboard's totals treat each category - Expense counts toward spend, Income counts toward earnings, and Neutral (Excluded) counts toward neither (for internal transfers, refunds you don't want to double count, etc.).</p>
+        <div style={{ display: "flex", gap: "8px", marginBottom: "14px", flexWrap: "wrap" }}>
+          <input value={newCat} onChange={e => setNewCat(e.target.value)} placeholder="New category name" style={{ ...input, flex: 1, minWidth: "160px" }}
+            onKeyDown={e => { if (e.key === "Enter" && addCategory(newCat, newCatBehavior)) setNewCat(""); }} />
+          <select value={newCatBehavior} onChange={e => setNewCatBehavior(e.target.value)} style={{ ...input, width: "170px" }}>
+            {BEHAVIOR_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+          <button style={btnPrimary} onClick={() => { if (addCategory(newCat, newCatBehavior)) setNewCat(""); }}><Plus size={14} /> Add</button>
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
           {spendingCategories.map(c => (
@@ -5154,6 +5415,9 @@ function SettingsTab({
               ) : (
                 <>
                   <span style={{ flex: 1 }}>{c}</span>
+                  <select value={categoryBehaviors[c] ?? defaultCategoryBehavior(c)} onChange={e => setCategoryBehavior(c, e.target.value)} style={{ ...input, width: "170px" }}>
+                    {BEHAVIOR_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
                   <button style={{ ...btn, padding: "4px 10px" }} onClick={() => { setEditingCat(c); setEditingCatValue(c); }}>Rename</button>
                   <button style={{ ...btn, padding: "6px" }} onClick={() => removeCategory(c)}><Trash2 size={14} /></button>
                 </>
