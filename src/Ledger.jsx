@@ -1,8 +1,8 @@
-// Version: 6.7 - Phase 5 Item 1 (Progressive Web App & Offline Caching Engine)
+// Version: 6.8 - Phase 5 Item 2 (Manual Ingestion Form & App Lock)
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
 import { BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
-import { Upload, Download, Plus, AlertCircle, Check, Copy, ChevronDown, Trash2, Settings, FolderOpen, Sun, Moon, X, Pencil, Undo2, Printer, ArrowUp, ArrowDown, LayoutGrid, Split, Merge, Cloud, UploadCloud, DownloadCloud, LogOut, Loader2 } from "lucide-react";
+import { Upload, Download, Plus, AlertCircle, Check, Copy, ChevronDown, Trash2, Settings, FolderOpen, Sun, Moon, X, Pencil, Undo2, Printer, ArrowUp, ArrowDown, LayoutGrid, Split, Merge, Cloud, UploadCloud, DownloadCloud, LogOut, Loader2, Lock, Fingerprint, Delete, KeyRound } from "lucide-react";
 
 // System categories drive core calculations (savings tracking, income totals, transfer exclusion) -
 // not user-editable, since removing or renaming one would silently break the math elsewhere.
@@ -736,6 +736,122 @@ async function dropboxDownloadVault(accessToken) {
   return res.text();
 }
 
+// --- App Lock (Phase 5 Item 2, v6.8) ----------------------------------------------------------------
+// Optional, off-by-default local lock screen: a 4-6 digit backup PIN plus an optional WebAuthn platform
+// authenticator (Face/Fingerprint/Windows Hello). Like Cloud Sync's config, none of this lives in
+// STORAGE_KEY or JSON export/import - it's per-browser device security config, not financial data (same
+// reasoning as THEME_KEY and the Cloud Sync keys above), so a restored JSON backup never carries someone
+// else's lock settings onto a new device, and this app's own no-backend rule is untouched: everything
+// below runs against window.crypto.subtle and the browser's own WebAuthn implementation, never a server
+// this project runs.
+//
+// Deliberately NOT a server-verified WebAuthn credential - a real relying party normally verifies the
+// signed assertion against the public key it stored at registration, which needs a COSE-key signature
+// verifier this app has no other reason to carry. What still makes the biometric option meaningful
+// without one: navigator.credentials.get() is a browser/OS-mediated API this page's own JS cannot forge
+// or script around - the platform authenticator refuses to produce ANY assertion unless the real
+// biometric or device-PIN check the OS itself owns succeeds. A successful resolve is still genuine local
+// proof-of-presence; this app just can't additionally confirm it was signed by the exact key it
+// registered. The PIN is the one fully self-contained check (PBKDF2-hashed, verified entirely in this
+// browser), which is why App Lock requires a PIN before it can be turned on at all - see
+// handleToggleLockEnabled in Ledger() - rather than ever leaving someone with only a biometric option
+// that could stop being offered (a browser update, a different device) with no fallback.
+const LOCK_ENABLED_KEY = "ledger:applock:enabled:v1";
+const LOCK_PIN_RECORD_KEY = "ledger:applock:pin:v1";
+const LOCK_WEBAUTHN_KEY = "ledger:applock:webauthn:v1";
+// Per-browser UI preference, same non-financial-data reasoning as THEME_KEY - which ingestion mode
+// (Manual Form vs Bulk Paste) the Log tab shows once the person has picked one explicitly.
+const INGESTION_MODE_KEY = "ledger:ingestionmode:v1";
+
+// Mirrors base64UrlEncode above, in reverse - restores the standard base64 alphabet and re-pads with
+// "=" (base64url per RFC 4648 §5 omits padding) before handing off to the existing base64ToBuf. Needed
+// to turn a stored WebAuthn credential.id (already base64url, per the Credential Management spec) back
+// into the raw bytes navigator.credentials.get's allowCredentials list expects.
+function base64UrlToBuf(str) {
+  let b64 = str.replace(/-/g, "+").replace(/_/g, "/");
+  while (b64.length % 4) b64 += "=";
+  return base64ToBuf(b64);
+}
+
+// PBKDF2-SHA256, reusing the exact same iteration count Cloud Sync's passphrase derivation uses
+// (PBKDF2_ITERATIONS) - this is a hash to verify against, not a key to encrypt with, so deriveBits
+// rather than deriveKey, but otherwise the identical primitive.
+async function derivePinHash(pin, saltBytes, iterations) {
+  const enc = new TextEncoder();
+  const baseKey = await window.crypto.subtle.importKey("raw", enc.encode(pin), "PBKDF2", false, ["deriveBits"]);
+  const bits = await window.crypto.subtle.deriveBits({ name: "PBKDF2", salt: saltBytes, iterations, hash: "SHA-256" }, baseKey, 256);
+  return bufToBase64(bits);
+}
+// `length` is stored alongside the hash purely so the lock screen's keypad knows how many digits to
+// expect before attempting a verify - it's metadata about the PIN, not part of the secret, the same way
+// a login form showing "PIN is 6 digits" wouldn't weaken it.
+async function createPinRecord(pin) {
+  const salt = window.crypto.getRandomValues(new Uint8Array(16));
+  const hash = await derivePinHash(pin, salt, PBKDF2_ITERATIONS);
+  return { salt: bufToBase64(salt), hash, iterations: PBKDF2_ITERATIONS, length: pin.length };
+}
+async function verifyPinRecord(pin, record) {
+  if (!record) return false;
+  const salt = base64ToBuf(record.salt);
+  const iterations = Number.isFinite(record.iterations) ? record.iterations : PBKDF2_ITERATIONS;
+  const hash = await derivePinHash(pin, salt, iterations);
+  return hash === record.hash;
+}
+
+function isWebAuthnAvailable() {
+  return typeof window !== "undefined" && !!window.PublicKeyCredential && !!navigator.credentials;
+}
+// Feature-detects an actual usable platform authenticator (not just WebAuthn support in general) before
+// the Settings panel offers "Enable biometrics" - avoids offering a control that would just fail on a
+// device with no Face/Fingerprint/Windows Hello sensor available to this browser.
+async function platformAuthenticatorAvailable() {
+  if (!isWebAuthnAvailable() || !window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable) return false;
+  try {
+    return await window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+  } catch {
+    return false;
+  }
+}
+// Registers a brand new platform-authenticator credential (triggers the OS's native Face/Fingerprint/
+// Windows Hello prompt). attestation:"none" - this app has no server to send an attestation statement
+// to, so there's nothing to gain from asking the authenticator to produce one. Only credential.id (a
+// base64url string, never a secret - see the module comment above) is kept; the private key itself
+// never leaves the authenticator hardware, which is the whole point of WebAuthn.
+async function registerBiometricCredential() {
+  const challenge = window.crypto.getRandomValues(new Uint8Array(32));
+  const userId = window.crypto.getRandomValues(new Uint8Array(16));
+  const credential = await navigator.credentials.create({
+    publicKey: {
+      challenge,
+      rp: { name: "Ledger" },
+      user: { id: userId, name: "ledger-local-user", displayName: "Ledger" },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+      authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required", residentKey: "preferred" },
+      attestation: "none",
+      timeout: 60000,
+    },
+  });
+  if (!credential) throw new Error("Biometric setup didn't complete.");
+  return { id: credential.id };
+}
+// Asks the platform authenticator to confirm the person's presence again on unlock. Resolves (truthy)
+// only if the OS's own biometric/device-PIN check succeeded; throws (NotAllowedError, a timeout, the
+// person cancelling) otherwise - callers treat any rejection as "fall back to the PIN keypad," never as
+// an error worth surfacing, since cancelling a biometric prompt to type a PIN instead is routine, not a
+// failure.
+async function verifyBiometricCredential(credentialId) {
+  const challenge = window.crypto.getRandomValues(new Uint8Array(32));
+  const assertion = await navigator.credentials.get({
+    publicKey: {
+      challenge,
+      allowCredentials: credentialId ? [{ id: base64UrlToBuf(credentialId), type: "public-key" }] : [],
+      userVerification: "required",
+      timeout: 60000,
+    },
+  });
+  return !!assertion;
+}
+
 const card = { background: "var(--surface-1)", border: "1px solid var(--border)", borderRadius: "14px", padding: "20px 22px", boxShadow: "0 1px 3px rgba(0,0,0,0.05)" };
 const label = { fontSize: "11px", fontWeight: 600, letterSpacing: "0.04em", textTransform: "uppercase", color: "var(--text-secondary)", marginBottom: "4px" };
 const num = { fontVariantNumeric: "tabular-nums" };
@@ -789,17 +905,19 @@ const THEME_CSS = `
 @keyframes ledger-spin { to { transform: rotate(360deg); } }
 .ledger-root .ledger-spin { animation: ledger-spin 0.9s linear infinite; }
 
-/* Mobile touch & viewport polishing (v6.7) - scoped to touch/narrow contexts only, so the dense
-   desktop mouse UI (small icon buttons, tight table rows) is untouched. Applies a 44px minimum hit
-   target (the WCAG/Apple/Material baseline for a reliably tappable control) to every button and
-   table row, and keeps wide content (tables, the split editor) scrollable within its own container
-   instead of clipping or forcing the page itself to scroll horizontally. */
+/* Mobile touch & viewport polishing (v6.7; extended v6.8 for the manual entry form and lock keypad) -
+   scoped to touch/narrow contexts only, so the dense desktop mouse UI (small icon buttons, tight table
+   rows) is untouched. Applies a 44px minimum hit target (the WCAG/Apple/Material baseline for a
+   reliably tappable control) to every button, text input/select, and table row, and keeps wide content
+   (tables, the split editor) scrollable within its own container instead of clipping or forcing the
+   page itself to scroll horizontally. */
 @media (max-width: 780px), (pointer: coarse) {
   .ledger-root button { min-height: 44px; }
   .ledger-root .ledger-tabs button { min-height: 44px; padding: 12px 16px; }
   .ledger-root table td, .ledger-root table th { padding: 10px 8px; }
   .ledger-root table td button, .ledger-root table th button { min-width: 44px; }
   .ledger-root input[type="checkbox"] { width: 20px; height: 20px; }
+  .ledger-root input:not([type="checkbox"]), .ledger-root select { min-height: 44px; }
 }
 `;
 
@@ -931,6 +1049,250 @@ function SplitEditor({ txn, categories, onSave, onCancel }) {
   );
 }
 
+// Today's date as "YYYY-MM-DD" in the local timezone (not toISOString, which is UTC and can land on
+// the wrong calendar day depending on the person's timezone/time of day) - matches isValidDateString's
+// expected shape exactly, so it's a valid default the moment the manual entry form mounts.
+function todayDateString() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+// Manual single-transaction entry (Phase 5 Item 2, v6.8) - the mobile-optimized alternative to the
+// bulk CSV/paste flow, toggled via the Ingestion Mode Selector above the "Add a new transaction" card
+// in Ledger(). Every field commits through the same onStage/onAddDirect callbacks Ledger() defines
+// (stageManualTransaction / addManualTransactionDirect), which share dedup + validation with the bulk
+// staging pipeline rather than duplicating it - see those functions' own comments for why a single
+// manual entry confirms a likely duplicate instead of silently skipping it the way a batch import does.
+function ManualTransactionForm({ categories, lookup, addCategory, onStage, onAddDirect }) {
+  const [date, setDate] = useState(() => todayDateString());
+  const [description, setDescription] = useState("");
+  // Tracks whether the person has picked a category themselves - once they have, the live suggestion
+  // below stops overriding it as they keep editing the description, the same "don't clobber a manual
+  // correction" rule commitStaging's upsert-on-correction logic already follows elsewhere. Modeled as a
+  // derived value (useMemo) rather than synced into its own state via an effect, so there's no
+  // setState-in-effect render cascade - category is just suggestedCategory until categoryTouched flips.
+  const [manualCategory, setManualCategory] = useState("");
+  const [categoryTouched, setCategoryTouched] = useState(false);
+  const [addingCategory, setAddingCategory] = useState(false);
+  const [newCategoryName, setNewCategoryName] = useState("");
+  const [txnType, setTxnType] = useState("expense"); // "expense" | "income" - drives the amount's sign
+  const [amountText, setAmountText] = useState("");
+
+  // Live categorization: the exact same regex/substring rules engine every keystroke that staging's
+  // "suggested" column already uses (see categorize()/stageRows above).
+  const suggestedCategory = useMemo(() => categorize(description, lookup).category || "", [description, lookup]);
+  const category = categoryTouched ? manualCategory : suggestedCategory;
+
+  function resetForm() {
+    setDate(todayDateString());
+    setDescription("");
+    setManualCategory("");
+    setCategoryTouched(false);
+    setAddingCategory(false);
+    setNewCategoryName("");
+    setTxnType("expense");
+    setAmountText("");
+  }
+
+  function buildRow() {
+    const magnitude = parseFloat(amountText);
+    const amount = Number.isFinite(magnitude) ? (txnType === "expense" ? -Math.abs(magnitude) : Math.abs(magnitude)) : NaN;
+    const desc = description.trim();
+    return { date, description: desc, merchant: desc, amount, category };
+  }
+
+  function handleCategorySelect(value) {
+    if (value === "__new__") { setAddingCategory(true); return; }
+    setManualCategory(value);
+    setCategoryTouched(true);
+  }
+  function confirmNewCategory() {
+    const trimmed = newCategoryName.trim();
+    if (addCategory(trimmed)) {
+      setManualCategory(trimmed);
+      setCategoryTouched(true);
+      setAddingCategory(false);
+      setNewCategoryName("");
+    }
+  }
+
+  function handleStage() {
+    if (onStage(buildRow())) resetForm();
+  }
+  function handleAddDirect() {
+    if (onAddDirect(buildRow())) resetForm();
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: "12px" }}>
+        <div>
+          <div style={label}>Date</div>
+          <input type="date" value={date} onChange={e => setDate(e.target.value)} style={input} />
+        </div>
+        <div style={{ gridColumn: "span 2" }}>
+          <div style={label}>Description</div>
+          <input type="text" value={description} onChange={e => setDescription(e.target.value)} placeholder="e.g. Uber Eats" style={input} />
+        </div>
+      </div>
+
+      <div>
+        <div style={label}>Category</div>
+        {!addingCategory ? (
+          <select value={category} onChange={e => handleCategorySelect(e.target.value)}
+            style={{ ...input, borderColor: !category ? "var(--border-warning)" : "var(--border)" }}>
+            <option value="">{description ? "No match - choose one" : "Choose a category..."}</option>
+            {categories.map(c => <option key={c} value={c}>{c}</option>)}
+            <option value="__new__">+ Add new category...</option>
+          </select>
+        ) : (
+          <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+            <input value={newCategoryName} onChange={e => setNewCategoryName(e.target.value)} placeholder="New category name" style={{ ...input, flex: 1, minWidth: "160px" }} autoFocus
+              onKeyDown={e => { if (e.key === "Enter") confirmNewCategory(); }} />
+            <button type="button" style={{ ...btn, padding: "8px 14px" }} onClick={confirmNewCategory}><Check size={14} /> Add</button>
+            <button type="button" style={{ ...btn, padding: "8px 14px" }} onClick={() => { setAddingCategory(false); setNewCategoryName(""); }}>Cancel</button>
+          </div>
+        )}
+      </div>
+
+      <div style={{ display: "flex", gap: "12px", flexWrap: "wrap", alignItems: "flex-end" }}>
+        <div>
+          <div style={label}>Type</div>
+          <div style={{ display: "flex", border: "1px solid var(--border-strong)", borderRadius: "var(--radius)", overflow: "hidden" }}>
+            <button type="button" onClick={() => setTxnType("expense")}
+              style={{ ...btn, border: "none", borderRadius: 0, background: txnType === "expense" ? "var(--text-danger)" : "var(--surface-1)", color: txnType === "expense" ? "#fff" : "var(--text-primary)" }}>
+              Expense
+            </button>
+            <button type="button" onClick={() => setTxnType("income")}
+              style={{ ...btn, border: "none", borderRadius: 0, background: txnType === "income" ? "var(--text-success)" : "var(--surface-1)", color: txnType === "income" ? "#fff" : "var(--text-primary)" }}>
+              Income
+            </button>
+          </div>
+        </div>
+        <div style={{ flex: 1, minWidth: "140px" }}>
+          <div style={label}>Amount</div>
+          <input type="number" inputMode="decimal" step="0.01" min="0" value={amountText} onChange={e => setAmountText(e.target.value)} placeholder="0.00" style={input} />
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+        <button type="button" style={btn} onClick={handleStage}><Plus size={14} /> Stage transaction</button>
+        <button type="button" style={btnPrimary} onClick={handleAddDirect}><Check size={14} /> Add directly</button>
+      </div>
+    </div>
+  );
+}
+
+// Full-screen App Lock overlay (Phase 5 Item 2, v6.8) - rendered by Ledger() in place of the entire app
+// while locked, so the ledger data is never in the DOM at all until authentication succeeds (not just
+// visually covered). See the module-level "App Lock" comment above for why the biometric path is a
+// meaningful local gate despite having no server to verify the signed assertion against.
+function LockOverlay({ pinRecord, webauthnCredential, onUnlock }) {
+  const [entered, setEntered] = useState("");
+  const [error, setError] = useState("");
+  const [checking, setChecking] = useState(false);
+  // A ref, not state - this only guards "attempt once per mount" and is never itself rendered, so
+  // there's no need for a re-render (or a setState-in-effect) just to flip it.
+  const biometricTriedRef = useRef(false);
+  const verifyingRef = useRef(false);
+
+  const pinLength = pinRecord && Number.isFinite(pinRecord.length) ? pinRecord.length : 6;
+
+  async function tryBiometric() {
+    if (!webauthnCredential || checking) return;
+    setChecking(true);
+    setError("");
+    try {
+      const ok = await verifyBiometricCredential(webauthnCredential.id);
+      if (ok) { onUnlock(); return; }
+    } catch {
+      // Cancelled, timed out, or unavailable right now - fall back to the PIN keypad silently, matching
+      // this app's general "safe fallback over a scary error" posture. Tapping away from a biometric
+      // prompt to use the PIN instead is routine, not a failure worth alerting on.
+    }
+    setChecking(false);
+  }
+
+  // Prompts for biometrics automatically, once, as soon as the overlay mounts - the PIN keypad below
+  // renders unconditionally at the same time, so there's always an immediate fallback visible rather
+  // than one gated behind the biometric attempt failing first.
+  useEffect(() => {
+    if (webauthnCredential && !biometricTriedRef.current) {
+      biometricTriedRef.current = true;
+      tryBiometric();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [webauthnCredential]);
+
+  useEffect(() => {
+    if (!pinRecord || entered.length !== pinLength || verifyingRef.current) return;
+    verifyingRef.current = true;
+    verifyPinRecord(entered, pinRecord).then(ok => {
+      verifyingRef.current = false;
+      if (ok) { onUnlock(); return; }
+      setError("Incorrect PIN");
+      setEntered("");
+    });
+  }, [entered, pinRecord, pinLength, onUnlock]);
+
+  function tapDigit(d) {
+    if (checking) return;
+    setError("");
+    setEntered(prev => (prev.length >= pinLength ? prev : prev + d));
+  }
+  function tapBackspace() {
+    setError("");
+    setEntered(prev => prev.slice(0, -1));
+  }
+
+  const keys = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "", "0", "back"];
+
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 9999, background: "var(--surface-0)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "20px", padding: "24px", boxSizing: "border-box" }}>
+      <Lock size={36} color="var(--text-accent)" />
+      <div style={{ fontSize: "18px", fontWeight: 600, color: "var(--text-primary)" }}>Ledger is locked</div>
+
+      {webauthnCredential && (
+        <button type="button" style={{ ...btn, minHeight: "48px", padding: "10px 20px" }} disabled={checking} onClick={tryBiometric}>
+          {checking ? <Loader2 size={16} className="ledger-spin" /> : <Fingerprint size={16} />}
+          {checking ? "Checking..." : "Use Face / Fingerprint"}
+        </button>
+      )}
+
+      {pinRecord ? (
+        <>
+          <div style={{ display: "flex", gap: "10px" }}>
+            {Array.from({ length: pinLength }).map((_, i) => (
+              <span key={i} style={{
+                width: "14px", height: "14px", borderRadius: "50%",
+                background: i < entered.length ? "var(--text-accent)" : "var(--surface-2)",
+                border: "1px solid var(--border-strong)", display: "inline-block",
+              }} />
+            ))}
+          </div>
+          {error && <div style={{ fontSize: "13px", color: "var(--text-danger)" }}>{error}</div>}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 64px)", gap: "12px" }}>
+            {keys.map((k, i) => k === "" ? <div key={i} /> : k === "back" ? (
+              <button key={i} type="button" style={{ ...btn, width: "64px", height: "64px", minHeight: "64px", borderRadius: "50%", justifyContent: "center" }} onClick={tapBackspace} title="Backspace">
+                <Delete size={18} />
+              </button>
+            ) : (
+              <button key={i} type="button" style={{ ...btn, width: "64px", height: "64px", minHeight: "64px", borderRadius: "50%", fontSize: "20px", justifyContent: "center" }} onClick={() => tapDigit(k)}>
+                {k}
+              </button>
+            ))}
+          </div>
+        </>
+      ) : (
+        <p style={{ fontSize: "13px", color: "var(--text-muted)", maxWidth: "320px", textAlign: "center" }}>
+          No PIN is set - this shouldn't normally happen, since App Lock requires one to be enabled.
+          Reload once unlocked and set a PIN from Settings.
+        </p>
+      )}
+    </div>
+  );
+}
+
 // Dashboard category filter: a checklist popover rather than a native <select multiple>, since
 // picking several non-adjacent categories out of two dozen is painful with a native multi-select.
 // "excluded" (not "included") is tracked so a category added later in Settings is included by
@@ -1058,6 +1420,22 @@ export default function Ledger() {
     return "light";
   });
   const [pasteText, setPasteText] = useState("");
+  // Ingestion Mode Selector (v6.8): which entry method the Log tab's "Add a new transaction" card
+  // shows. A saved choice always wins; otherwise defaults to Manual Form on a narrow (<780px) viewport
+  // at first load, matching the same 780px breakpoint the mobile touch CSS already uses, and to Bulk
+  // Paste everywhere else - a one-time default, not something that re-switches on resize afterward.
+  const [ingestionMode, setIngestionModeState] = useState(() => {
+    try {
+      const saved = window.localStorage.getItem(INGESTION_MODE_KEY);
+      if (saved === "manual" || saved === "bulk") return saved;
+      if (typeof window !== "undefined" && window.innerWidth && window.innerWidth < 780) return "manual";
+    } catch { /* localStorage/window unavailable - fall through to the desktop default */ }
+    return "bulk";
+  });
+  function setIngestionMode(mode) {
+    setIngestionModeState(mode);
+    try { window.localStorage.setItem(INGESTION_MODE_KEY, mode); } catch { /* non-critical UI pref - safe to lose */ }
+  }
   const [filterCat, setFilterCat] = useState("all");
   const [budget, setBudget] = useState(() => persisted.budget || DEFAULT_BUDGET);
   const [recurringConfig, setRecurringConfig] = useState(() => persisted.recurringConfig || DEFAULT_RECURRING_CONFIG);
@@ -1104,6 +1482,94 @@ export default function Ledger() {
   }, [hasUnsavedChanges, staging.length]);
 
   const [storageWarning, setStorageWarning] = useState("");
+
+  // --- App Lock (Phase 5 Item 2, v6.8): see the module-level "App Lock" comment above for the
+  // crypto/WebAuthn helpers and why none of this is part of STORAGE_KEY. `locked` starts true whenever
+  // App Lock was already on at the last save, so a fresh page load (or PWA resume - see the
+  // visibilitychange effect below) never shows ledger data before authentication resolves.
+  const [lockEnabled, setLockEnabledState] = useState(() => {
+    try { return window.localStorage.getItem(LOCK_ENABLED_KEY) === "1"; } catch { return false; }
+  });
+  const [pinRecord, setPinRecordState] = useState(() => {
+    try { const raw = window.localStorage.getItem(LOCK_PIN_RECORD_KEY); return raw ? JSON.parse(raw) : null; } catch { return null; }
+  });
+  const [webauthnCredential, setWebauthnCredentialState] = useState(() => {
+    try { const raw = window.localStorage.getItem(LOCK_WEBAUTHN_KEY); return raw ? JSON.parse(raw) : null; } catch { return null; }
+  });
+  const [locked, setLocked] = useState(() => {
+    try { return window.localStorage.getItem(LOCK_ENABLED_KEY) === "1"; } catch { return false; }
+  });
+
+  function setLockEnabled(enabled) {
+    setLockEnabledState(enabled);
+    try { window.localStorage.setItem(LOCK_ENABLED_KEY, enabled ? "1" : "0"); } catch { /* non-critical config - safe to lose */ }
+  }
+  function savePinRecord(record) {
+    setPinRecordState(record);
+    try {
+      if (record) window.localStorage.setItem(LOCK_PIN_RECORD_KEY, JSON.stringify(record));
+      else window.localStorage.removeItem(LOCK_PIN_RECORD_KEY);
+    } catch { /* non-critical config - safe to lose */ }
+  }
+  function saveWebauthnCredential(cred) {
+    setWebauthnCredentialState(cred);
+    try {
+      if (cred) window.localStorage.setItem(LOCK_WEBAUTHN_KEY, JSON.stringify(cred));
+      else window.localStorage.removeItem(LOCK_WEBAUTHN_KEY);
+    } catch { /* non-critical config - safe to lose */ }
+  }
+  // A PIN is the one fully self-contained unlock method (see the module comment above), so App Lock
+  // can't be turned on without one already set - otherwise losing/never-getting biometric access on a
+  // later visit (a browser update, a different device) would lock the person out with no way back in.
+  function handleToggleLockEnabled(next) {
+    if (next && !pinRecord) {
+      alert("Set a backup PIN first - App Lock needs at least one way to unlock before it can be turned on.");
+      return;
+    }
+    setLockEnabled(next);
+  }
+  async function handleSetPin(pin) {
+    const record = await createPinRecord(pin);
+    savePinRecord(record);
+  }
+  function handleRemovePin() {
+    if (lockEnabled && !webauthnCredential) {
+      alert("App Lock is on and this is your only unlock method - disable App Lock first, or enable biometrics before removing your PIN.");
+      return;
+    }
+    const ok = confirm("Remove your backup PIN? You'll need to set a new one to use App Lock's PIN fallback again.");
+    if (!ok) return;
+    savePinRecord(null);
+  }
+  async function handleEnableBiometrics() {
+    try {
+      const cred = await registerBiometricCredential();
+      saveWebauthnCredential(cred);
+    } catch (err) {
+      alert("Couldn't set up biometrics: " + (err && err.message ? err.message : "the request was cancelled or isn't supported here."));
+    }
+  }
+  function handleRemoveBiometrics() {
+    if (lockEnabled && !pinRecord) {
+      alert("App Lock is on and this is your only unlock method - disable App Lock first, or set a PIN before removing biometrics.");
+      return;
+    }
+    saveWebauthnCredential(null);
+  }
+  function handleUnlock() {
+    setLocked(false);
+  }
+  // Re-locks the instant the tab/PWA is backgrounded, so the overlay is already showing by the time it
+  // becomes visible again - covers both "closed and reopened" and "switched away and back" without
+  // needing to distinguish the two.
+  useEffect(() => {
+    if (!lockEnabled) return;
+    function onVisibilityChange() {
+      if (document.visibilityState === "hidden") setLocked(true);
+    }
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, [lockEnabled]);
 
   // --- Cloud Sync (Phase 4 Item 4, v6.5; dual-provider v6.6): see the module-level "Cloud Sync" block
   // above for the crypto/GIS/Drive/Dropbox helper functions. Only per-browser config (Client ID/App
@@ -1636,6 +2102,58 @@ export default function Ledger() {
   }
 
   function discardStaging() { setStaging([]); }
+
+  // --- Manual single-transaction entry (Phase 5 Item 2, v6.8) -------------------------------------
+  // ManualTransactionForm's two action buttons ("Stage transaction" / "Add directly") both funnel
+  // through here. Shares dedup (dedupeAgainstCommitted) and shape validation (isValidDateString) with
+  // the bulk staging pipeline rather than inventing a parallel one - the one deliberate difference is
+  // that a single deliberate manual entry asks via confirm() before proceeding on a likely duplicate
+  // instead of silently skipping it the way a multi-row CSV/paste batch does, matching this app's
+  // existing "confirm() for consequential single actions" pattern (row delete, category removal) rather
+  // than the bulk path's silent skip-and-report.
+  function validateManualRow(row) {
+    if (!isValidDateString(row.date) || !row.merchant || !Number.isFinite(row.amount)) {
+      alert("Enter a valid date, description, and numeric amount first.");
+      return false;
+    }
+    if (!row.category) {
+      alert("Choose a category (or add a new one) before saving.");
+      return false;
+    }
+    return true;
+  }
+  function confirmIfDuplicate(row) {
+    const { duplicateCount } = dedupeAgainstCommitted([row], [...transactions, ...staging]);
+    if (duplicateCount === 0) return true;
+    return confirm("A transaction with the same date, description, and amount is already in your log. Add it anyway?");
+  }
+  function stageManualTransaction(row) {
+    if (!validateManualRow(row)) return false;
+    if (!confirmIfDuplicate(row)) return false;
+    const suggested = categorize(row.merchant, lookup).category;
+    setStaging(prev => [...prev, {
+      stageId: nextStageId.current++, date: row.date, description: row.description,
+      merchant: row.merchant, amount: row.amount, suggested, category: row.category, matched: true,
+    }]);
+    return true;
+  }
+  // Upserts a merchant lookup correction exactly like commitStaging does when the chosen category
+  // differs from what the rules engine would have suggested - so a manual entry teaches the rules
+  // engine the same way correcting a staged row already does, rather than only bulk imports doing so.
+  function addManualTransactionDirect(row) {
+    if (!validateManualRow(row)) return false;
+    if (!confirmIfDuplicate(row)) return false;
+    const suggested = categorize(row.merchant, lookup).category;
+    if (row.category !== suggested) {
+      const norm = normalize(row.merchant);
+      setLookup(prev => sortLookup([[norm, row.category], ...prev.filter(([k]) => k !== norm)]));
+    }
+    setTransactions(prev => [...prev, {
+      id: nextId.current++, date: row.date, description: row.description, merchant: row.merchant,
+      amount: row.amount, category: row.category,
+    }]);
+    return true;
+  }
 
   // --- Category management ---
   function addCategory(name) {
@@ -2479,6 +2997,20 @@ export default function Ledger() {
     ),
   };
 
+  // App Lock (v6.8): while locked, the ledger data is never rendered into the DOM at all - not just
+  // covered by an overlay - so nothing below this point (transactions, budget, everything else derived
+  // above) reaches the page until LockOverlay's onUnlock fires. Every hook this component uses is
+  // already declared above this point, so branching the returned JSX here doesn't touch the rules of
+  // hooks - it's still the same unconditional call order every render, just a different tree returned.
+  if (lockEnabled && locked) {
+    return (
+      <div className="ledger-root" data-theme={theme} style={{ fontFamily: "var(--font-sans)", color: "var(--text-primary)", background: "var(--surface-0)", maxWidth: "100%" }}>
+        <style>{THEME_CSS}</style>
+        <LockOverlay pinRecord={pinRecord} webauthnCredential={webauthnCredential} onUnlock={handleUnlock} />
+      </div>
+    );
+  }
+
   return (
     <div className="ledger-root" data-theme={theme} style={{ fontFamily: "var(--font-sans)", color: "var(--text-primary)", background: "var(--surface-0)", maxWidth: "100%", padding: "4px" }}>
       <style>{THEME_CSS}</style>
@@ -2540,23 +3072,45 @@ export default function Ledger() {
             </div>
           )}
           <div style={card}>
-            <div style={{ ...label, marginBottom: "10px" }}>Add a new statement</div>
-            <div style={{ display: "flex", gap: "12px", flexWrap: "wrap", alignItems: "flex-start" }}>
-              <label style={{ ...btn, cursor: "pointer" }}>
-                <Upload size={14} /> Upload CSV
-                <input type="file" accept=".csv" style={{ display: "none" }} onChange={e => { const f = e.target.files[0]; if (f) handleCSV(f); e.target.value = ""; }} />
-              </label>
-              <label style={{ ...btn, cursor: "pointer" }}>
-                <FolderOpen size={14} /> Select folder
-                <input ref={folderInputRef} type="file" webkitdirectory="" multiple style={{ display: "none" }}
-                  onChange={e => { const files = e.target.files; if (files && files.length) handleFolderSelect(files); e.target.value = ""; }} />
-              </label>
-              <span style={{ fontSize: "12px", color: "var(--text-muted)", alignSelf: "center" }}>Columns: Date, Description, Merchant, Amount (negative = money out). "Select folder" grabs every CSV inside it and skips anything already in your log.</span>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "10px", marginBottom: "10px" }}>
+              <div style={label}>Add a new transaction</div>
+              {/* Ingestion Mode Selector (v6.8) - a saved choice always wins; see ingestionMode's
+                  useState initializer above for the mobile-viewport-width first-run default. */}
+              <div style={{ display: "flex", border: "1px solid var(--border-strong)", borderRadius: "var(--radius)", overflow: "hidden" }}>
+                <button type="button" onClick={() => setIngestionMode("manual")}
+                  style={{ ...btn, border: "none", borderRadius: 0, background: ingestionMode === "manual" ? "var(--text-accent)" : "var(--surface-1)", color: ingestionMode === "manual" ? "#fff" : "var(--text-primary)" }}>
+                  Manual Form
+                </button>
+                <button type="button" onClick={() => setIngestionMode("bulk")}
+                  style={{ ...btn, border: "none", borderRadius: 0, background: ingestionMode === "bulk" ? "var(--text-accent)" : "var(--surface-1)", color: ingestionMode === "bulk" ? "#fff" : "var(--text-primary)" }}>
+                  Bulk Paste (CSV/TSV)
+                </button>
+              </div>
             </div>
-            <div style={{ marginTop: "12px" }}>
-              <textarea value={pasteText} onChange={e => setPasteText(e.target.value)} placeholder={"Or paste rows, one per line: 2026-09-05\\tpos purchase\\tfizz\\t-23.73"} style={{ ...input, minHeight: "70px", fontFamily: "var(--font-mono)", fontSize: "12px" }} />
-              <button style={{ ...btnPrimary, marginTop: "8px" }} onClick={handlePasteAdd}><Plus size={14} /> Add pasted rows</button>
-            </div>
+
+            {ingestionMode === "manual" ? (
+              <ManualTransactionForm categories={allCategories} lookup={lookup} addCategory={addCategory}
+                onStage={stageManualTransaction} onAddDirect={addManualTransactionDirect} />
+            ) : (
+              <>
+                <div style={{ display: "flex", gap: "12px", flexWrap: "wrap", alignItems: "flex-start" }}>
+                  <label style={{ ...btn, cursor: "pointer" }}>
+                    <Upload size={14} /> Upload CSV
+                    <input type="file" accept=".csv" style={{ display: "none" }} onChange={e => { const f = e.target.files[0]; if (f) handleCSV(f); e.target.value = ""; }} />
+                  </label>
+                  <label style={{ ...btn, cursor: "pointer" }}>
+                    <FolderOpen size={14} /> Select folder
+                    <input ref={folderInputRef} type="file" webkitdirectory="" multiple style={{ display: "none" }}
+                      onChange={e => { const files = e.target.files; if (files && files.length) handleFolderSelect(files); e.target.value = ""; }} />
+                  </label>
+                  <span style={{ fontSize: "12px", color: "var(--text-muted)", alignSelf: "center" }}>Columns: Date, Description, Merchant, Amount (negative = money out). "Select folder" grabs every CSV inside it and skips anything already in your log.</span>
+                </div>
+                <div style={{ marginTop: "12px" }}>
+                  <textarea value={pasteText} onChange={e => setPasteText(e.target.value)} placeholder={"Or paste rows, one per line: 2026-09-05\\tpos purchase\\tfizz\\t-23.73"} style={{ ...input, minHeight: "70px", fontFamily: "var(--font-mono)", fontSize: "12px" }} />
+                  <button style={{ ...btnPrimary, marginTop: "8px" }} onClick={handlePasteAdd}><Plus size={14} /> Add pasted rows</button>
+                </div>
+              </>
+            )}
           </div>
 
           {pendingMapping && <CSVMappingPanel mapping={pendingMapping} onConfirm={confirmManualMapping} onCancel={() => setPendingMapping(null)} />}
@@ -3023,6 +3577,9 @@ export default function Ledger() {
         spendingCategories={spendingCategories} addCategory={addCategory} renameCategory={renameCategory} removeCategory={removeCategory}
         lookup={lookup} allCategories={allCategories} addLookupRule={addLookupRule} updateLookupRuleCategory={updateLookupRuleCategory} removeLookupRule={removeLookupRule}
         recurringConfig={recurringConfig} updateRecurringConfig={updateRecurringConfig} resetRecurringConfig={resetRecurringConfig}
+        lockEnabled={lockEnabled} onToggleLockEnabled={handleToggleLockEnabled}
+        hasPin={!!pinRecord} onSetPin={handleSetPin} onRemovePin={handleRemovePin}
+        hasBiometrics={!!webauthnCredential} onEnableBiometrics={handleEnableBiometrics} onRemoveBiometrics={handleRemoveBiometrics}
         cloudProvider={cloudProvider} setCloudProvider={setCloudProvider}
         cloudClientId={cloudClientId} setCloudClientId={setCloudClientId}
         dropboxAppKey={dropboxAppKey} setDropboxAppKey={setDropboxAppKey}
@@ -3085,6 +3642,7 @@ function RegexRuleTester() {
 function SettingsTab({
   spendingCategories, addCategory, renameCategory, removeCategory, lookup, allCategories, addLookupRule, updateLookupRuleCategory, removeLookupRule,
   recurringConfig, updateRecurringConfig, resetRecurringConfig,
+  lockEnabled, onToggleLockEnabled, hasPin, onSetPin, onRemovePin, hasBiometrics, onEnableBiometrics, onRemoveBiometrics,
   cloudProvider, setCloudProvider, cloudClientId, setCloudClientId, dropboxAppKey, setDropboxAppKey,
   cloudPassphrase, setCloudPassphrase, googleConnected, dropboxConnected, cloudStatus, cloudStatusMessage, cloudLastSynced, dropboxLastSynced,
   onConnectGoogle, onDisconnectGoogle, onConnectDropbox, onDisconnectDropbox, onSyncNowToCloud, onPullFromCloud,
@@ -3106,6 +3664,12 @@ function SettingsTab({
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+      <LockSettingsPanel
+        lockEnabled={lockEnabled} onToggleLockEnabled={onToggleLockEnabled}
+        hasPin={hasPin} onSetPin={onSetPin} onRemovePin={onRemovePin}
+        hasBiometrics={hasBiometrics} onEnableBiometrics={onEnableBiometrics} onRemoveBiometrics={onRemoveBiometrics}
+      />
+
       <div style={card}>
         <div style={{ ...label, marginBottom: "10px" }}>Manage categories</div>
         <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 12px" }}>These are the spending categories offered in every dropdown. System categories (Income, Transfers, Review) aren't shown here since removing them would break the math elsewhere.</p>
@@ -3213,6 +3777,99 @@ function SettingsTab({
         onConnectDropbox={onConnectDropbox} onDisconnectDropbox={onDisconnectDropbox}
         onSyncNow={onSyncNowToCloud} onPullFromCloud={onPullFromCloud}
       />
+    </div>
+  );
+}
+
+// Settings > App security & lock (Phase 5 Item 2, v6.8). Purely a controlled view, same pattern as
+// CloudSyncPanel below - every field is a prop owned by Ledger(), so this component holds no secret of
+// its own beyond the in-progress "new PIN" text fields and whether a platform authenticator is actually
+// available on this device (checked once on mount, since offering "Enable biometrics" on a device with
+// no Face/Fingerprint/Windows Hello sensor would just fail).
+function LockSettingsPanel({ lockEnabled, onToggleLockEnabled, hasPin, onSetPin, onRemovePin, hasBiometrics, onEnableBiometrics, onRemoveBiometrics }) {
+  const [biometricsAvailable, setBiometricsAvailable] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    platformAuthenticatorAvailable().then(ok => { if (!cancelled) setBiometricsAvailable(ok); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const [pin1, setPin1] = useState("");
+  const [pin2, setPin2] = useState("");
+  const [pinError, setPinError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function handleSavePin() {
+    setPinError("");
+    if (!/^\d{4,6}$/.test(pin1)) { setPinError("PIN must be 4-6 digits."); return; }
+    if (pin1 !== pin2) { setPinError("PINs don't match."); return; }
+    setBusy(true);
+    try {
+      await onSetPin(pin1);
+      setPin1(""); setPin2("");
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function handleEnableBiometrics() {
+    setBusy(true);
+    try { await onEnableBiometrics(); } finally { setBusy(false); }
+  }
+
+  return (
+    <div style={card}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px", flexWrap: "wrap", gap: "8px" }}>
+        <div style={label}>App security & lock</div>
+        <label style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "13px", cursor: "pointer", minHeight: "44px" }}>
+          <input type="checkbox" checked={lockEnabled} onChange={e => onToggleLockEnabled(e.target.checked)} style={{ width: "20px", height: "20px" }} />
+          Enable App Lock
+        </label>
+      </div>
+      <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 12px" }}>
+        When on, a full-screen lock covers your ledger every time this tab or installed app is opened or
+        resumed, until you unlock it with your PIN or biometrics. This is a local, on-device lock only -
+        it can't protect a JSON backup file or a cloud sync copy, and it isn't a server-verified
+        credential the way logging into a website would be, since this app has no server at all (see the
+        biometric option below).
+      </p>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: "16px" }}>
+        <div>
+          <div style={{ fontSize: "12px", fontWeight: 600, marginBottom: "6px", display: "flex", alignItems: "center", gap: "6px" }}>
+            Backup PIN {hasPin && <Check size={13} color="var(--text-success)" />}
+          </div>
+          <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 8px" }}>
+            {hasPin ? "A PIN is set. Enter a new one below to replace it." : "Set a 4-6 digit PIN - this is required before App Lock can be turned on, as the one fallback that can never stop working on you."}
+          </p>
+          <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "6px" }}>
+            <input type="password" inputMode="numeric" pattern="[0-9]*" maxLength={6} value={pin1} onChange={e => setPin1(e.target.value.replace(/\D/g, ""))} placeholder="New PIN" style={{ ...input, width: "120px" }} />
+            <input type="password" inputMode="numeric" pattern="[0-9]*" maxLength={6} value={pin2} onChange={e => setPin2(e.target.value.replace(/\D/g, ""))} placeholder="Confirm PIN" style={{ ...input, width: "120px" }} />
+          </div>
+          {pinError && <div style={{ fontSize: "12px", color: "var(--text-danger)", marginBottom: "6px" }}>{pinError}</div>}
+          <div style={{ display: "flex", gap: "8px" }}>
+            <button style={btnPrimary} disabled={busy} onClick={handleSavePin}><KeyRound size={14} /> Save PIN</button>
+            {hasPin && <button style={btn} onClick={onRemovePin}><Trash2 size={14} /> Remove PIN</button>}
+          </div>
+        </div>
+
+        <div>
+          <div style={{ fontSize: "12px", fontWeight: 600, marginBottom: "6px", display: "flex", alignItems: "center", gap: "6px" }}>
+            Biometrics {hasBiometrics && <Check size={13} color="var(--text-success)" />}
+          </div>
+          <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 8px" }}>
+            {biometricsAvailable
+              ? "Uses this device's own Face/Fingerprint/Windows Hello unlock (a WebAuthn platform authenticator). Your PIN above still works as a fallback."
+              : "This browser/device doesn't offer a platform biometric authenticator right now - the PIN is your only unlock method here."}
+          </p>
+          <div style={{ display: "flex", gap: "8px" }}>
+            {!hasBiometrics ? (
+              <button style={btn} disabled={busy || !biometricsAvailable} onClick={handleEnableBiometrics}><Fingerprint size={14} /> Enable biometrics</button>
+            ) : (
+              <button style={btn} onClick={onRemoveBiometrics}><Trash2 size={14} /> Remove biometrics</button>
+            )}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

@@ -66,6 +66,17 @@ explicitly configured `NetworkOnly` so the offline/cache layer can never interce
 serve a sync request. A person who never installs the app or never goes offline sees no behavior
 change at all.
 
+**Update, v6.8:** Two independent additions, neither of which touches `STORAGE_KEY`. First, a Manual
+Single-Transaction Form (Log tab) as a mobile-optimized alternative to the bulk CSV/paste flow, behind
+an Ingestion Mode Selector — the bulk parser itself is untouched. Second, an optional local App Lock
+(Settings tab): a PBKDF2-hashed backup PIN plus an optional WebAuthn platform-authenticator (Face/
+Fingerprint/Windows Hello) biometric unlock, gating a full-screen overlay shown on open/resume. Like
+Cloud Sync, App Lock is an explicit, discussed exception to "no auth for this app" from §1's non-goals —
+but it's a *local* device lock, not an account system: there's still no server, still no user accounts,
+and the lock protects only this browser's live view of the app, not a JSON backup or a cloud sync copy.
+See §3's Ingestion Mode & Manual Entry and App Lock subsections for the full breakdown, including why
+the biometric check is meaningful without a server to verify its signature against.
+
 ---
 
 ## 2. Core Architecture & Logic Constraints
@@ -582,6 +593,128 @@ way a data-shape change would be.
   real mobile browser (Add to Home Screen, airplane-mode reload, Lighthouse PWA audit), same
   "build/lint-checked, not live-verified" caveat every other unverified Phase 4 item in §5 carries.
 
+### Ingestion Mode & Manual Entry (v6.8+)
+
+The Log tab's "Add a new transaction" card now offers two entry paths behind a segmented toggle
+(`ingestionMode`, `"manual" | "bulk"`) sitting above the card's body:
+
+- **Persistence**: a per-browser UI preference, same non-financial-data reasoning as `THEME_KEY` —
+  `"ledger:ingestionmode:v1"`, never part of `STORAGE_KEY` or JSON export/import. A saved choice always
+  wins; with none saved yet, the `useState` lazy initializer defaults to `"manual"` when
+  `window.innerWidth < 780` at first mount (the same 780px breakpoint the v6.7 mobile touch CSS media
+  query already uses) and `"bulk"` otherwise. This is a one-time default, not a live resize listener —
+  rotating a tablet mid-session doesn't silently swap which form is showing.
+- **Bulk Paste (CSV/TSV)**: byte-for-byte the pre-existing Upload CSV / Select folder / paste-textarea
+  UI (`handleCSV`/`handleFolderSelect`/`handlePasteAdd`, all unchanged) — the toggle only wraps this in
+  a conditional render, it doesn't touch the parser.
+- **Manual Form** (`ManualTransactionForm`): Date (`<input type="date">`, defaults to today via
+  `todayDateString()`, a local-timezone `YYYY-MM-DD` — deliberately not `toISOString()`, which is UTC
+  and can land on the wrong calendar day depending on timezone/time of day), Description (plain text),
+  Category (a `<select>` of `allCategories` plus a "+ Add new category..." option that reveals an inline
+  text input wired to the existing `addCategory`), and a Type (Expense/Income) toggle paired with an
+  unsigned numeric Amount input — the sign is applied when the row is built, not stored as a separate
+  field.
+  - **Live categorization**: a `useMemo` (`suggestedCategory`) re-runs `categorize()` — the exact same
+    regex/substring rules engine `stageRows`'s "suggested" column already uses — on every Description
+    keystroke. The category shown is `categoryTouched ? manualCategory : suggestedCategory`: a derived
+    value, not state synced via an effect, specifically so there's no effect-triggered render cascade
+    and no risk of a later suggestion clobbering a category the person picked themselves. Picking one
+    from the dropdown (or confirming a new one) sets `categoryTouched = true` for the rest of that entry.
+  - **Stage Transaction** vs **Add Directly**: both call into `Ledger()` functions
+    (`stageManualTransaction` / `addManualTransactionDirect`) that share `dedupeAgainstCommitted` and
+    `isValidDateString` with the bulk pipeline rather than duplicating validation — the one deliberate
+    difference from bulk import is that a single manual entry asks via `confirm()` before proceeding on
+    a likely duplicate (same date/description/amount already in the log or in staging) instead of
+    silently skipping it the way a multi-row batch does, matching this app's existing "`confirm()` for
+    consequential single actions" pattern (row delete, category removal) rather than the bulk path's
+    silent skip-and-report. "Add Directly" additionally upserts a merchant lookup correction when the
+    chosen category differs from what `categorize()` would have suggested — the same "teach the rules
+    engine on correction" behavior `commitStaging` already does for staged rows, now extended to a
+    direct add too. Both clear the form back to defaults on success; validation failures (missing/
+    invalid date, empty description, unparseable amount, no category chosen) `alert()` instead, matching
+    `saveTxnEdit`'s existing inline-edit validation style.
+
+### App Lock (v6.8+)
+
+Optional, off by default (`lockEnabled`). A full-screen `LockOverlay` covers the entire app — not just a
+visual overlay on top of it, but the actual returned JSX branch, so ledger data is never in the DOM
+until authentication succeeds — shown whenever `lockEnabled && locked`. `locked` starts `true` on mount
+if App Lock was already on at the last save, and a `visibilitychange` listener sets it back to `true`
+the instant the tab/PWA is backgrounded (`document.visibilityState === "hidden"`), so the overlay is
+already in place by the time the tab becomes visible again — this covers both "closed and reopened" and
+"switched away and back" without needing to tell them apart.
+
+**Persisted config** — three more small, separate localStorage keys, same pattern as `THEME_KEY` and
+the Cloud Sync keys: per-browser device-security config, not financial data, so none of it is part of
+`STORAGE_KEY` or JSON export/import (a restored backup never carries someone else's lock settings onto a
+new device, and a device's own lock settings never leak into an exported backup file).
+
+```js
+"ledger:applock:enabled:v1"     // "1" | "0"
+"ledger:applock:pin:v1"         // JSON: { salt, hash, iterations, length } - see below
+"ledger:applock:webauthn:v1"    // JSON: { id } - a WebAuthn credential.id, not a secret
+```
+
+**Backup PIN**: PBKDF2-SHA256, reusing the exact same iteration count (`PBKDF2_ITERATIONS`, 100,000)
+Cloud Sync's passphrase derivation already uses — `derivePinHash` is `deriveBits` where
+`deriveAesKey` is `deriveKey`, otherwise the identical primitive off `window.crypto.subtle`, no
+third-party crypto library. `createPinRecord` stores `{ salt, hash, iterations, length }`; `length` (the
+PIN's digit count, 4–6) travels alongside purely so the lock screen's keypad knows how many dots to show
+and when to attempt a verify — it's metadata about the PIN, not part of the secret, the same way a login
+form showing "your PIN is 6 digits" wouldn't weaken it. `verifyPinRecord` re-derives with the stored
+salt/iterations and compares hashes; `LockOverlay` calls it automatically once `entered.length ===
+pinLength`, clearing the attempt and showing "Incorrect PIN" on a mismatch. **App Lock cannot be turned
+on without a PIN already set** (`handleToggleLockEnabled` blocks it with an `alert()`) — the PIN is the
+one fully self-contained unlock method, so this guarantees a fallback that can never stop being offered
+(a browser update, a different device) the way the biometric option below could.
+
+**Biometrics (WebAuthn platform authenticator)**: `registerBiometricCredential` calls
+`navigator.credentials.create()` with `authenticatorAttachment: "platform"` and
+`userVerification: "required"` — this triggers the OS's native Face ID/Windows Hello/fingerprint prompt
+directly; only the returned `credential.id` (already a base64url string per the Credential Management
+spec, and not a secret) is persisted, never a private key, which never leaves the authenticator
+hardware. `platformAuthenticatorAvailable()` (wrapping
+`PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()`) feature-detects an actual usable
+authenticator before Settings offers "Enable biometrics," so the control isn't offered somewhere it
+would just fail. On unlock, `verifyBiometricCredential` calls `navigator.credentials.get()` with the
+stored credential id in `allowCredentials`; `LockOverlay` auto-attempts this once per mount (tracked via
+a `useRef`, not state, specifically so this doesn't need a setState-in-effect render cascade) and again
+on tapping "Use Face / Fingerprint," and the PIN keypad renders unconditionally alongside it the whole
+time — an immediate fallback, not one gated behind the biometric attempt failing first. Any rejection
+(cancelled, timed out, no authenticator available right now) is caught and silently falls through to the
+keypad, matching this app's general "safe fallback over a scary error" posture — tapping away from a
+biometric prompt to type a PIN instead is routine, not a failure worth alerting on.
+
+**Deliberately not a server-verified WebAuthn credential** — worth being explicit about, since this is
+the one place this app's WebAuthn usage looks unlike how WebAuthn is normally described. A real relying
+party verifies the assertion's signature against the public key it stored at registration; that needs a
+COSE-key signature verifier this app has no other reason to carry, and there's no server here to hold
+that verification step anyway (§1's no-backend rule). What still makes the biometric option meaningful
+without one: `navigator.credentials.get()` is a browser/OS-mediated API this page's own JS cannot forge
+or script around — the platform authenticator refuses to produce *any* assertion unless the real
+biometric or device-PIN check the OS itself owns succeeds. A successful resolve is still genuine local
+proof-of-presence; this app just can't additionally confirm the assertion was signed by the exact key it
+registered, the way a real relying party's server would. This is why the PIN — fully self-contained,
+verified entirely in this browser — is the required fallback rather than an afterthought.
+
+**What App Lock doesn't protect**: a JSON export/import backup file, or a Cloud Sync copy (§3's Cloud
+Sync subsection) — both are separate from this browser's live session and neither is gated by this
+feature. This is the same "local, on-device" scope Settings' own App Lock panel text says explicitly.
+
+**Touch targets (Part of the same v6.8 pass)**: the existing v6.7 mobile media query
+(`@media (max-width: 780px), (pointer: coarse)`) gained a rule sizing every non-checkbox `input`/
+`select` to a 44px minimum height, filling the one gap left after v6.7 (which covered buttons, tabs, and
+table cells but not form fields) — the Manual Form's fields and the PIN Settings inputs both pick this up
+for free. The lock screen's PIN keypad buttons are sized 64×64px unconditionally (not media-query-gated)
+since a full-screen security prompt should have generous touch targets on desktop too, not only on a
+narrow viewport.
+
+Checked by `npm run build` + `npm run lint` only so far (both clean, zero new errors against the §5
+baseline) — not yet exercised live: no real WebAuthn platform authenticator round-trip on an actual
+device, no live-browser check of the visibilitychange re-lock behavior, no unit tests for
+`derivePinHash`/`createPinRecord`/`verifyPinRecord` or the manual entry dedup/validation paths. Same
+"build/lint-checked, not live-verified" caveat every other unverified Phase 4/5 item in §5 carries.
+
 ---
 
 ## 4. Version Archive Index
@@ -826,12 +959,49 @@ pick which file to restore from if a rollback is ever needed.
     testing on a real device) — same "build/lint-checked, not live-verified" caveat most of Phase 4
     still carries.
 
+- **v6.8 — "Phase 5 Item 2" (Manual Ingestion Form & App Lock).**
+  - **Ingestion Mode Selector & Manual Form**: the Log tab's "Add a new transaction" card gained a
+    segmented Manual Form / Bulk Paste (CSV/TSV) toggle (`ingestionMode`, persisted per-browser,
+    defaulting to Manual Form on a <780px viewport at first load). Bulk Paste is the pre-existing
+    CSV/folder-upload/paste-textarea flow, untouched. Manual Form (`ManualTransactionForm`) is a
+    one-row Date/Description/Category/Type(Expense-Income)/Amount form with live regex-rules-engine
+    categorization as the person types, and two actions — Stage Transaction and Add Directly — both
+    sharing dedup/validation with the bulk staging pipeline (`stageManualTransaction`/
+    `addManualTransactionDirect`). See §3's Ingestion Mode & Manual Entry subsection for the full
+    breakdown.
+  - **App Lock**: a new Settings > "App security & lock" panel adds an optional, off-by-default local
+    lock screen — a PBKDF2-hashed 4-6 digit backup PIN (reusing Cloud Sync's exact `PBKDF2_ITERATIONS`
+    primitive via `window.crypto.subtle`) plus an optional WebAuthn platform-authenticator (Face/
+    Fingerprint/Windows Hello) biometric unlock. A full-screen `LockOverlay` — the entire app's returned
+    JSX branches to just this overlay, not merely a visual cover — shows on open/resume
+    (`visibilitychange`-driven re-lock) until either check succeeds. App Lock can't be turned on without
+    a PIN already set, since the PIN is the one fully self-contained fallback. See §3's App Lock
+    subsection for the full breakdown, including why the biometric check is a meaningful local gate
+    despite this app having no server to verify a signed assertion against.
+  - **Touch targets**: extended v6.7's mobile media query to give every non-checkbox `input`/`select` a
+    44px minimum height (closing the one gap v6.7 left), and sized the lock screen's PIN keypad buttons
+    at 64×64px unconditionally (not media-query-gated), since a full-screen security prompt warrants
+    generous touch targets on desktop too.
+  - **Zero new persisted `STORAGE_KEY` fields**: both features live entirely in their own separate
+    localStorage keys (`ledger:ingestionmode:v1`, `ledger:applock:*`), same non-financial-data pattern
+    as `THEME_KEY` and the Cloud Sync keys — no `isValidX`/migration change, no JSON export/import
+    change, and (for App Lock specifically) a deliberate, discussed exception to §1's "no auth for this
+    app" non-goal that stays a *local* device lock, not an account system — see the "Update, v6.8" note
+    in §1.
+  - **Verified by `npm run build` + `npm run lint` only so far**: both clean, `npm run lint` reporting
+    exactly the same 9 pre-existing errors as the Phase 4 baseline (§5) — zero new lint errors or
+    warnings introduced. Not yet exercised live: no real WebAuthn platform-authenticator round-trip on
+    an actual device, no live-browser check of the visibilitychange re-lock behavior or the manual
+    form's live categorization, no unit tests for the PIN hashing helpers or the manual-entry dedup/
+    validation paths. Same "build/lint-checked, not live-verified" caveat every other unverified Phase
+    4/5 item here carries.
+
 ---
 
 ## 5. Current State
 
 The current master component is **`src/Ledger.jsx`** — version comment
-`// Version: 6.7 - Phase 5 Item 1 (Progressive Web App & Offline Caching Engine)`,
+`// Version: 6.8 - Phase 5 Item 2 (Manual Ingestion Form & App Lock)`,
 component export `export default function Ledger()`, rendered from `src/App.jsx`. The prior v6.1
 snapshot ("Final Phase 3," all Phase 3 roadmap items complete and verified — unit tests for every
 migration/validation function, a full regression suite across prior versions' features, and a
@@ -839,25 +1009,29 @@ live-browser Playwright smoke test with screenshots) is kept at `_archive/Ledger
 
 Phase 4 (Items 1-4, spanning v6.2-v6.6: Transaction Splitting, Advanced Regex Rules Engine,
 Predictive Forecasting & Runway Analytics, Serverless Cloud Sync, Dual-Provider Cloud Sync) is
-complete. Phase 5 Item 1 (v6.7, PWA & Offline Caching) is now also implemented — see §3's PWA & Offline
-Caching subsection and §4's v6.7 entry for the full breakdown. Across all of these, **only Cloud
-Sync's Google Drive path** has been manually live-verified end-to-end (connect, Sync Now, Pull from
-Cloud, against a real Google Cloud OAuth client and Drive account — see v6.5's entry in §4).
-Everything else — Transaction Splitting, the Regex Rules Engine, Runway Analytics, Dropbox's
-transport, and now the PWA/offline layer — is checked with `npm run build` and `npm run lint` only,
-with no unit tests written yet (for `splitTransaction`/`mergeSplitGroup`; `parseRegexRule`/
-`categorize`'s regex branch; `estimateMilestone`; the encrypt/decrypt + Drive/Dropbox REST helpers;
-the PKCE helpers) and no full live-browser regression pass across the whole app. v6.7 specifically has
-not been exercised as an installed PWA in a real mobile browser (Add to Home Screen, an actual
-airplane-mode reload, a Lighthouse PWA audit, or manual touch-target testing on a real device) — see
-§3 and §4's v6.7 entries for exactly what was and wasn't checked.
+complete. Phase 5 Items 1-2 (v6.7 PWA & Offline Caching, v6.8 Manual Ingestion Form & App Lock) are
+now also implemented — see §3's respective subsections and §4's v6.7/v6.8 entries for the full
+breakdown. Across all of these, **only Cloud Sync's Google Drive path** has been manually
+live-verified end-to-end (connect, Sync Now, Pull from Cloud, against a real Google Cloud OAuth client
+and Drive account — see v6.5's entry in §4). Everything else — Transaction Splitting, the Regex Rules
+Engine, Runway Analytics, Dropbox's transport, the PWA/offline layer, and now the manual ingestion form
+and App Lock — is checked with `npm run build` and `npm run lint` only, with no unit tests written yet
+(for `splitTransaction`/`mergeSplitGroup`; `parseRegexRule`/`categorize`'s regex branch;
+`estimateMilestone`; the encrypt/decrypt + Drive/Dropbox REST helpers; the PKCE helpers; v6.8's
+`derivePinHash`/`createPinRecord`/`verifyPinRecord` or its manual-entry dedup/validation paths) and no
+full live-browser regression pass across the whole app. v6.7 has not been exercised as an installed PWA
+in a real mobile browser (Add to Home Screen, an actual airplane-mode reload, a Lighthouse PWA audit,
+or manual touch-target testing on a real device); v6.8 has not been exercised against a real WebAuthn
+platform authenticator on an actual device, nor has its `visibilitychange` re-lock behavior or the
+manual form's live categorization been checked in a running browser — see §3 and §4's respective
+entries for exactly what was and wasn't checked.
 
 **Pre-existing `npm run lint` errors, unrelated to Phase 4/5:** `npm run lint` on the codebase as
 received at the start of Phase 4 Item 4 already reported 9 errors having nothing to do with cloud
 sync — an unused `Settings` icon import, two `no-useless-assignment` warnings inside `migrateBudget`,
 two unused `err` catch-clause bindings (theme init, autosave), and four React Compiler
 `react-hooks` findings (`set-state-in-effect` ×3, `immutability` ×1) in pre-existing effects/memos.
-v6.5, v6.6, and v6.7 were each written to introduce **zero new** lint errors or warnings on top of
+v6.5 through v6.8 were each written to introduce **zero new** lint errors or warnings on top of
 that baseline (verified by diffing `npm run lint` before/after each) rather than silently accumulating
 more debt, but none of those 9 pre-existing ones were touched or fixed here since they're out of
 scope for these features — flagging them explicitly so a future pass doesn't mistake "9 errors" for
@@ -866,9 +1040,10 @@ something Phase 4/5 introduced.
 Everything above — the no-backend constraint, the `STORAGE_KEY` autosave shape, `computeNextId`,
 the independent-idempotent-migration pattern, and the exact data schemas in §3 — should be treated
 as load-bearing for Phase 5 unless the user explicitly asks to change the architecture. Cloud Sync
-(v6.5, extended to a second provider in v6.6) and the PWA/offline caching layer (v6.7) are the only two
-explicitly-discussed departures from the original non-goals list (see §1's "Update, v6.5"/"Update,
-v6.6"/"Update, v6.7" notes) — neither licenses quietly extending the app toward a real backend,
-multi-device sync of any other kind, a third sync provider, background sync/push notifications, or a
-different persistence layer for the core `STORAGE_KEY` payload; any of those would need the same
-explicit discussion these two features themselves got, not an assumption that "the door is open now."
+(v6.5, extended to a second provider in v6.6), the PWA/offline caching layer (v6.7), and App Lock
+(v6.8) are the only explicitly-discussed departures from the original non-goals list (see §1's
+"Update, v6.5"/"Update, v6.6"/"Update, v6.7"/"Update, v6.8" notes) — none of these license quietly
+extending the app toward a real backend, multi-device sync of any other kind, a third sync provider,
+background sync/push notifications, a user-account system, or a different persistence layer for the
+core `STORAGE_KEY` payload; any of those would need the same explicit discussion these features
+themselves got, not an assumption that "the door is open now."
