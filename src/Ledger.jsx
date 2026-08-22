@@ -1,5 +1,6 @@
-// Version: 6.9.8 - Refined staging duplicate detection: exact/substring/" - "-split merchant match
-// (sign-agnostic, replacing the looser word-token-overlap heuristic), plus a "Hide duplicates" toggle
+// Version: 6.9.9 - Fixed credit card auto-detect: chequing/debit/savings accounts now always force
+// Invert Signs off, polarity heuristic keys off retail-row majority instead of payment keywords
+// alone, and the toggle fully resets on every new ingest instead of leaking across imports
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
 import { BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
@@ -446,17 +447,22 @@ function combineDebitCredit(debitRaw, creditRaw) {
   return String(amount);
 }
 
-// Some credit card exports write purchases as positive and "payment received"/"bill payment" rows
-// (money going toward paying off the balance) as negative - the exact mirror image of this app's own
-// negative=money-out convention. A row whose merchant/description names itself as a payment *and*
-// carries a negative amount is a strong signal the whole file is in that inverted convention, so the
-// "Invert Signs" toggle can default to on for a person who might not think to flip it themselves.
-const CREDIT_CARD_PAYMENT_PATTERN = /payment|bill pmt|transit \d+/i;
+// A credit card statement writes ordinary purchases as positive and payment-toward-the-balance rows
+// as negative - the exact mirror image of this app's own negative=money-out convention. Keying off
+// payment-keyword rows alone doesn't actually distinguish the two account types, though: a chequing
+// account has "bill payment"/e-transfer rows too, and those are ALSO negative there (money still
+// left the account). What's actually diagnostic is the polarity of the ORDINARY retail rows - dining,
+// gas, groceries, shopping - once payment/deposit/payroll/transfer rows are excluded: a majority of
+// positive amounts among those means credit card (invert=true); a majority of negative amounts means
+// a normal debit/chequing statement (invert=false, the default when retail rows are tied or absent).
+const NON_RETAIL_PATTERN = /payment|deposit|payroll|transfer|e-transfer|interac/i;
 function looksLikeCreditCardFormat(rows) {
-  return rows.some(r => {
-    const amt = parseFlexibleAmount(r.amount);
-    return Number.isFinite(amt) && amt < 0 && CREDIT_CARD_PAYMENT_PATTERN.test(`${r.merchant || ""} ${r.description || ""}`);
-  });
+  const retail = rows
+    .map(r => ({ amt: parseFlexibleAmount(r.amount), text: `${r.merchant || ""} ${r.description || ""}` }))
+    .filter(r => Number.isFinite(r.amt) && r.amt !== 0 && !NON_RETAIL_PATTERN.test(r.text));
+  if (retail.length === 0) return false;
+  const positive = retail.filter(r => r.amt > 0).length;
+  return positive > retail.length - positive;
 }
 
 // Account auto-detect for a single uploaded CSV (handleCSV): checks the file's own name plus its
@@ -477,6 +483,15 @@ function guessAccountFromFile(filename, rawText) {
   if (CREDIT_ACCOUNT_HINT.test(haystack)) return isScotiabank ? "Scotiabank Visa" : "Credit Card";
   if (CHEQUING_ACCOUNT_HINT.test(haystack)) return isScotiabank ? "Scotiabank Chequing" : "Chequing";
   return "";
+}
+
+// True when an account name or filename clearly names a chequing/debit/savings account rather than
+// a credit product (reuses CHEQUING_ACCOUNT_HINT above). A chequing account is never plausibly a
+// credit card statement no matter what its rows look like, so this guard overrides
+// looksLikeCreditCardFormat's polarity heuristic outright rather than just weighing against it - see
+// stageRowsWithSignDetection, the only caller.
+function isChequingLikeAccount(text) {
+  return CHEQUING_ACCOUNT_HINT.test(text || "");
 }
 
 // A lookup key wrapped in slashes with optional trailing flags (e.g. "/^uber\s*eats/i") is a regex
@@ -2113,9 +2128,10 @@ export default function Ledger() {
   // "Credit Card mode": some card issuers export purchases as positive and payments-toward-the-
   // balance as negative - the mirror image of this app's own negative=money-out convention. When on,
   // every amount staged from a CSV/paste import is multiplied by -1 before it reaches staging. See
-  // looksLikeCreditCardFormat for the auto-detect heuristic that defaults this on for a file that
-  // looks like it needs it; ccFormatDetected only drives the "detected" badge, not the toggle itself,
-  // so it can go true/false across imports without silently overriding a choice already made.
+  // stageRowsWithSignDetection for the auto-detect heuristic (looksLikeCreditCardFormat, guarded by
+  // isChequingLikeAccount) that decides this fresh on every new ingest - both this toggle and
+  // ccFormatDetected (which drives the "detected" badge) reset and re-derive from scratch each time,
+  // rather than carrying over from whatever a previous, possibly different-account import left them at.
   const [invertSigns, setInvertSigns] = useState(false);
   const [ccFormatDetected, setCcFormatDetected] = useState(false);
   // The account every currently-staged row will be tagged with once committed (see commitStaging) -
@@ -2663,19 +2679,24 @@ export default function Ledger() {
 
   // Every stageRows call site funnels through here instead of calling it directly, so the credit-
   // card-format auto-detect (see looksLikeCreditCardFormat) runs once, in one place, on the actual
-  // rows about to be staged. `invertSigns` (component state) only updates for the *next* render, so
-  // this computes the effective flag for THIS call itself (current toggle state OR a fresh
-  // detection) rather than reading the stale pre-update value. Detection only ever turns the toggle
-  // on, never off, so it can't silently undo a choice already made; ccFormatDetected just drives the
-  // "detected" badge and is free to flip both ways across imports.
-  // `accountOverride` is optional and passed straight through to stageRows - see handleCSV, the one
-  // caller that needs it (a just-detected account, staged before its own setStagingAccount() call
-  // has actually committed to state).
-  function stageRowsWithSignDetection(rows, accountOverride) {
-    const detected = looksLikeCreditCardFormat(rows);
+  // rows about to be staged. Every new ingest decides its own polarity fresh - `invertSigns` is
+  // fully reset to whatever this batch's own detection concludes, rather than inheriting or ORing in
+  // whatever the toggle was left at by a previous, possibly different-account import (that "state
+  // leakage" was the bug: importing a credit card statement then a chequing one right after could
+  // silently double-invert the second file). A chequing/debit/savings account - by name (detected or
+  // currently selected) or by filename - overrides the polarity check outright and always forces the
+  // toggle off, since no chequing account is plausibly a credit card statement regardless of what its
+  // rows look like. `accountOverride`/`filenameForGuard` are optional; see handleCSV, the one caller
+  // that has a just-detected account (staged before its own setStagingAccount() call has actually
+  // committed to state) and an actual filename to check.
+  function stageRowsWithSignDetection(rows, accountOverride, filenameForGuard) {
+    const effectiveAccount = accountOverride !== undefined ? accountOverride : stagingAccount;
+    const isChequing = isChequingLikeAccount(effectiveAccount) || isChequingLikeAccount(filenameForGuard);
+    const detected = isChequing ? false : looksLikeCreditCardFormat(rows);
+
     setCcFormatDetected(detected);
-    if (detected) setInvertSigns(true);
-    stageRows(rows, { invertSigns: invertSigns || detected, account: accountOverride });
+    setInvertSigns(detected);
+    stageRows(rows, { invertSigns: detected, account: accountOverride });
   }
 
   // Called from SkippedRowsDrawer once a skipped row's Date/Merchant/Amount/Category have all been
@@ -2773,7 +2794,7 @@ export default function Ledger() {
         if (result.needsMapping) {
           setPendingMapping(result);
         } else {
-          stageRowsWithSignDetection(result.rows, guessedAccount);
+          stageRowsWithSignDetection(result.rows, guessedAccount, file.name);
         }
       },
     });
