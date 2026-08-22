@@ -1,8 +1,13 @@
-// Version: 6.9.11 - Retroactive "Scan Duplicates" tool in the Transaction Log (findDuplicateClusters:
-// matching amount + date within 1 day + matching/substring merchant text) with a Duplicate Cleaner
-// review modal and a toast on delete; Customizable Category Behaviors in Settings (per-category
-// Income/Expense/Neutral override, backwards-compatible with the old INCOME:/TRANSFER:/EXCLUDE:
-// prefix convention) now drives classifyTxnKind and every Dashboard total that depends on it
+// Version: 6.9.12 - Category spending now nets refunds against their original purchase instead of
+// summing magnitudes (a $150 purchase + $150 return nets to $0, not $300) - fixed across
+// txnExpenseAmount, the category ranking + top-merchants drill-down, the monthly cash flow chart's
+// outflow bars, and the fixed-vs-discretionary breakdown. Added a first-class "Investment" category
+// Behavior (Settings), defaulting "Investing"/"Investments" categories to it, which now excludes
+// dedicated investment categories from lifestyle-spend analytics entirely and feeds a new dedicated
+// "Investments & Wealth Accumulation" Dashboard widget (monthly contribution chart + top destinations)
+// below the cash flow chart. The KPI grid is now Total Earned / Total Lifestyle Spend (net) / Total
+// Invested / Net Cash Remaining (earned − spend − invested) / Investment Rate %, replacing the old
+// Net Savings + Avg Daily Spend tiles
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
 import { BarChart, Bar, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
@@ -34,29 +39,34 @@ const NON_SPEND = new Set(SYSTEM_CATEGORIES);
 const INCOME_CATS = new Set(["INCOME: Employment","INCOME: Benefits","INCOME: Reimbursement","INCOME: Resale"]);
 
 // --- Sign-resilient category classification (Dashboard Overhaul + Customizable Category Behaviors) --
-// Classifies a transaction into "income" | "expense" | "neutral" using each category's configured
-// *behavior* (see the categoryBehaviors state below and Settings > Spending Categories > Behavior
-// dropdown) rather than a fixed prefix rule or raw amount sign alone - a person can mark any category
-// Income/Expense/Neutral (Excluded) regardless of what it's named, so an income row saved with the
-// wrong sign, or a transfer that was never really spend to begin with, doesn't quietly distort the
-// Dashboard's totals. A category with no explicit entry in categoryBehaviors - nothing set yet, a
-// system category nobody's touched the dropdown for, or a payload saved before this feature existed -
-// falls back to defaultCategoryBehavior's prefix-based guess, so this is fully backwards compatible
-// with every browser's already-saved data. Amount sign only gets the final word for a genuinely
-// uncategorized row, since "no category yet" isn't itself a category: a positive uncategorized amount
-// reads as income, a negative one as spend.
-const VALID_BEHAVIORS = new Set(["income", "expense", "neutral"]);
+// Classifies a transaction into "income" | "expense" | "investment" | "neutral" using each category's
+// configured *behavior* (see the categoryBehaviors state below and Settings > Spending Categories >
+// Behavior dropdown) rather than a fixed prefix rule or raw amount sign alone - a person can mark any
+// category Income/Expense/Investment/Neutral (Excluded) regardless of what it's named, so an income
+// row saved with the wrong sign, or a transfer that was never really spend to begin with, doesn't
+// quietly distort the Dashboard's totals. A category with no explicit entry in categoryBehaviors -
+// nothing set yet, a system category nobody's touched the dropdown for, or a payload saved before this
+// feature existed - falls back to defaultCategoryBehavior's prefix-based guess, so this is fully
+// backwards compatible with every browser's already-saved data. Amount sign only gets the final word
+// for a genuinely uncategorized row, since "no category yet" isn't itself a category: a positive
+// uncategorized amount reads as income, a negative one as spend.
+const VALID_BEHAVIORS = new Set(["income", "expense", "investment", "neutral"]);
 // Shared option list for every Behavior <select> in Settings (existing categories + the add-category
-// form), so the three choices and their labels only need to be written once.
+// form), so the four choices and their labels only need to be written once.
 const BEHAVIOR_OPTIONS = [
   { value: "expense", label: "Expense" },
   { value: "income", label: "Income" },
+  { value: "investment", label: "Investment" },
   { value: "neutral", label: "Neutral (Excluded)" },
 ];
 function defaultCategoryBehavior(catName) {
   const cat = catName || "";
   if (cat.startsWith("INCOME:")) return "income";
   if (cat.startsWith("TRANSFER:") || cat.startsWith("EXCLUDE:") || cat.startsWith("REVIEW:")) return "neutral";
+  // Plain (unprefixed) category names a person would recognize as "money going toward long-term
+  // wealth building" - matched by name rather than prefix since these are ordinary, user-editable
+  // spending categories (WEALTHSIMPLE_CATEGORY = "Investing" among them), not a system category.
+  if (cat.toLowerCase() === "investing" || cat.toLowerCase() === "investments") return "investment";
   return "expense";
 }
 function classifyTxnKind(t, categoryBehaviors) {
@@ -66,9 +76,15 @@ function classifyTxnKind(t, categoryBehaviors) {
   return VALID_BEHAVIORS.has(configured) ? configured : defaultCategoryBehavior(cat);
 }
 // Always non-negative magnitudes built on classifyTxnKind, so a caller summing them never needs to
-// remember which raw sign convention a given category happens to use.
+// remember which raw sign convention a given category happens to use. txnExpenseAmount nets refunds
+// against outflows within the "expense" kind (a refund lands as a positive amount on the same
+// expense-behavior category, so subtracting the signed amount - rather than summing its magnitude -
+// correctly cancels a return against its original purchase instead of double-counting it as more
+// spend); txnIncomeAmount/txnInvestedAmount aren't given the same treatment since neither income nor
+// investment categories carry the same "refund" semantics in this app's transaction model.
 function txnIncomeAmount(t, categoryBehaviors) { return classifyTxnKind(t, categoryBehaviors) === "income" ? Math.abs(t.amount) : 0; }
-function txnExpenseAmount(t, categoryBehaviors) { return classifyTxnKind(t, categoryBehaviors) === "expense" ? Math.abs(t.amount) : 0; }
+function txnExpenseAmount(t, categoryBehaviors) { return classifyTxnKind(t, categoryBehaviors) === "expense" ? -t.amount : 0; }
+function txnInvestedAmount(t, categoryBehaviors) { return classifyTxnKind(t, categoryBehaviors) === "investment" ? Math.abs(t.amount) : 0; }
 
 // --- v4.1 one-time data migration: fold the old "TRANSFER: Wealthsimple" category forward into the
 // new "Investing" spending category, wherever ledger data gets loaded from. Three small, independent
@@ -1116,8 +1132,9 @@ function milestoneColor(m) {
 // to build the default order below). Adding a new dashboard section in a future version means adding
 // one entry here; normalizeDashboardLayout (below) then folds it into any already-saved layout.
 const DASHBOARD_SECTIONS = [
-  { id: "summaryCards", label: "KPI summary grid (earned, spent, net savings, avg daily spend)" },
+  { id: "summaryCards", label: "KPI summary grid (earned, lifestyle spend, invested, net cash, investment rate)" },
   { id: "trendLine", label: "Monthly cash flow trend (income vs. spending)" },
+  { id: "investments", label: "Investments & wealth accumulation" },
   { id: "categoryBar", label: "Category spending breakdown & ranking" },
   { id: "fixedVsDiscretionary", label: "Fixed vs. discretionary cost breakdown" },
   { id: "cumulativeNet", label: "Cumulative net position area chart" },
@@ -1136,8 +1153,8 @@ function isValidDashboardLayout(l) {
 }
 
 // categoryBehaviors (Customizable Category Behaviors, Settings > Spending Categories) is a plain
-// { [categoryName]: "income" | "expense" | "neutral" } map, sparse by design - only categories a
-// person has actually touched the Behavior dropdown for get an entry (see classifyTxnKind's
+// { [categoryName]: "income" | "expense" | "investment" | "neutral" } map, sparse by design - only
+// categories a person has actually touched the Behavior dropdown for get an entry (see classifyTxnKind's
 // defaultCategoryBehavior fallback above for everything else). A key with an unrecognized value is
 // enough to reject the whole map, same "validate before applying anything" rule every other saved-
 // data shape in this file follows.
@@ -3317,15 +3334,16 @@ export default function Ledger() {
   }
 
   // --- Category management ---
-  // `behavior` defaults to "expense" so a category added without ever touching the Behavior dropdown
-  // (e.g. programmatically, or from a form that predates this feature) lands on exactly what
-  // defaultCategoryBehavior would already have guessed for a plain, unprefixed name - explicit rather
-  // than relying on the sparse-map fallback, so what's shown in Settings always matches what's stored.
+  // A missing/invalid `behavior` falls back to defaultCategoryBehavior(trimmed) - not a hardcoded
+  // "expense" - so a category added without ever touching the Behavior dropdown (e.g. programmatically,
+  // or from a form that predates this feature) still lands on exactly what defaultCategoryBehavior
+  // would guess for its name (e.g. "Investing"/"Investments" -> investment), explicit rather than
+  // relying on the sparse-map fallback, so what's shown in Settings always matches what's stored.
   function addCategory(name, behavior) {
     const trimmed = name.trim();
     if (!trimmed || allCategories.includes(trimmed)) return false;
     setSpendingCategories(prev => [...prev, trimmed]);
-    setCategoryBehaviors(prev => ({ ...prev, [trimmed]: VALID_BEHAVIORS.has(behavior) ? behavior : "expense" }));
+    setCategoryBehaviors(prev => ({ ...prev, [trimmed]: VALID_BEHAVIORS.has(behavior) ? behavior : defaultCategoryBehavior(trimmed) }));
     return true;
   }
   function renameCategory(oldName, newName) {
@@ -3646,17 +3664,22 @@ export default function Ledger() {
   );
 
   // --- Widget 1: High-level KPI summary grid -----------------------------------------------------
+  // dashTotalSpent is already net of refunds (see txnExpenseAmount) - a $150 purchase and its $150
+  // return in the same category/window sum to $0, not $300, since a refund lands as a positive amount
+  // on the same expense-behavior category as the original purchase.
   const dashTotalEarned = useMemo(() => dashWindowTxns.reduce((s, t) => s + txnIncomeAmount(t, categoryBehaviors), 0), [dashWindowTxns, categoryBehaviors]);
   const dashTotalSpent = useMemo(() => dashWindowTxns.reduce((s, t) => s + txnExpenseAmount(t, categoryBehaviors), 0), [dashWindowTxns, categoryBehaviors]);
+  const dashTotalInvested = useMemo(() => dashWindowTxns.reduce((s, t) => s + txnInvestedAmount(t, categoryBehaviors), 0), [dashWindowTxns, categoryBehaviors]);
+  // Net Cash Remaining subtracts invested dollars from the older Income-minus-Spend "net savings"
+  // figure - money moved into an investment category left the checking/spending picture just as
+  // surely as an expense did, it just went somewhere trackable instead of disappearing into "spend".
   const dashNetSavings = dashTotalEarned - dashTotalSpent;
-  const dashSavingsRatePct = dashTotalEarned > 0 ? (dashNetSavings / dashTotalEarned) * 100 : null;
-  const dashWindowDays = Math.max(1, Math.round((new Date(`${dashWindow.to}T00:00:00`) - new Date(`${dashWindow.from}T00:00:00`)) / 86400000) + 1);
-  const dashAvgDailySpend = dashTotalSpent / dashWindowDays;
+  const dashNetCashRemaining = dashNetSavings - dashTotalInvested;
+  const dashInvestmentRatePct = dashTotalEarned > 0 ? (dashTotalInvested / dashTotalEarned) * 100 : null;
 
   const dashPrevTotalEarned = useMemo(() => dashPrevWindowTxns.reduce((s, t) => s + txnIncomeAmount(t, categoryBehaviors), 0), [dashPrevWindowTxns, categoryBehaviors]);
   const dashPrevTotalSpent = useMemo(() => dashPrevWindowTxns.reduce((s, t) => s + txnExpenseAmount(t, categoryBehaviors), 0), [dashPrevWindowTxns, categoryBehaviors]);
-  const dashPrevWindowDays = Math.max(1, Math.round((new Date(`${dashPrevWindow.to}T00:00:00`) - new Date(`${dashPrevWindow.from}T00:00:00`)) / 86400000) + 1);
-  const dashPrevAvgDailySpend = dashPrevTotalSpent / dashPrevWindowDays;
+  const dashPrevTotalInvested = useMemo(() => dashPrevWindowTxns.reduce((s, t) => s + txnInvestedAmount(t, categoryBehaviors), 0), [dashPrevWindowTxns, categoryBehaviors]);
 
   // Percent change vs. the prior equivalent window - null (rendered as "n/a") when there's nothing in
   // the prior window to compare against, rather than a misleading "+Infinity%"/"0%".
@@ -3666,7 +3689,7 @@ export default function Ledger() {
   }
   const dashEarnedTrendPct = dashTimeframe === "all" ? null : pctChange(dashTotalEarned, dashPrevTotalEarned);
   const dashSpentTrendPct = dashTimeframe === "all" ? null : pctChange(dashTotalSpent, dashPrevTotalSpent);
-  const dashAvgDailySpendTrendPct = dashTimeframe === "all" ? null : pctChange(dashAvgDailySpend, dashPrevAvgDailySpend);
+  const dashInvestedTrendPct = dashTimeframe === "all" ? null : pctChange(dashTotalInvested, dashPrevTotalInvested);
 
   // --- Widget 2: Monthly cash flow trend -----------------------------------------------------------
   const dashMonthlyCashFlow = useMemo(() => {
@@ -3676,7 +3699,9 @@ export default function Ledger() {
       const kind = classifyTxnKind(t, categoryBehaviors);
       if (kind !== "income" && kind !== "expense") return;
       const bucket = byMonth.get(m) || { month: m, income: 0, expense: 0 };
-      if (kind === "income") bucket.income += Math.abs(t.amount); else bucket.expense += Math.abs(t.amount);
+      // Outflow nets refunds the same way txnExpenseAmount does (-t.amount, not Math.abs(t.amount)) -
+      // otherwise this chart's own bars wouldn't sum to the "Total outflow" stat shown right above it.
+      if (kind === "income") bucket.income += Math.abs(t.amount); else bucket.expense -= t.amount;
       byMonth.set(m, bucket);
     });
     return [...byMonth.values()].sort((a, b) => a.month.localeCompare(b.month)).map(m => ({
@@ -3688,13 +3713,47 @@ export default function Ledger() {
     }));
   }, [dashWindowTxns, categoryBehaviors]);
 
+  // --- Widget: Investments & wealth accumulation -------------------------------------------------
+  // Excluded entirely from dashMonthlyCashFlow above (classifyTxnKind now returns "investment", not
+  // "expense", for these rows) so contributions don't get counted as lifestyle spend AND investment at
+  // once - this widget is their one dedicated home. Summed as a plain magnitude (not netted like
+  // txnExpenseAmount) since a contribution/withdrawal pair isn't the same "purchase vs. return of that
+  // exact purchase" relationship a refund has to its expense.
+  const dashMonthlyInvestments = useMemo(() => {
+    const byMonth = new Map();
+    dashWindowTxns.forEach(t => {
+      if (classifyTxnKind(t, categoryBehaviors) !== "investment") return;
+      const m = t.date.slice(0, 7);
+      byMonth.set(m, (byMonth.get(m) || 0) + Math.abs(t.amount));
+    });
+    return [...byMonth.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([month, total]) => ({ month, total: Math.round(total) }));
+  }, [dashWindowTxns, categoryBehaviors]);
+  const dashTopInvestmentDestinations = useMemo(() => {
+    const totals = freshTally();
+    dashWindowTxns.forEach(t => {
+      if (classifyTxnKind(t, categoryBehaviors) !== "investment") return;
+      const m = t.merchant || "(no merchant)";
+      totals[m] = (totals[m] || 0) + Math.abs(t.amount);
+    });
+    return Object.entries(totals).map(([merchant, total]) => ({ merchant, total: Math.round(total) }))
+      .filter(m => m.total > 0).sort((a, b) => b.total - a.total).slice(0, 5);
+  }, [dashWindowTxns, categoryBehaviors]);
+
   // --- Widget 3: Category spending breakdown & ranking -----------------------------------------
+  // classifyTxnKind's "investment" kind (distinct from "expense" as of the Investments pillar) already
+  // keeps dedicated investment categories like "Investing" out of this consumer/lifestyle ranking
+  // without any extra filtering here - excluding them was the whole point of giving investment
+  // contributions their own behavior instead of leaving them tagged as an ordinary expense category.
   const dashCategoryRanking = useMemo(() => {
     const totals = freshTally();
     dashWindowTxns.forEach(t => {
       if (classifyTxnKind(t, categoryBehaviors) !== "expense") return;
       const cat = t.category || "Uncategorized";
-      totals[cat] = (totals[cat] || 0) + Math.abs(t.amount);
+      // Net a refund (positive amount, same expense-behavior category as the original purchase)
+      // against its outflows instead of summing magnitudes - see txnExpenseAmount's comment. A
+      // category that's fully refunded nets to (rounds to) $0 and is dropped by the total > 0 filter
+      // below, exactly like a category with no spend in this window at all.
+      totals[cat] = (totals[cat] || 0) - t.amount;
     });
     const entries = Object.entries(totals).filter(([, total]) => total > 0);
     const sum = entries.reduce((s, [, total]) => s + total, 0);
@@ -3705,17 +3764,18 @@ export default function Ledger() {
   const dashCategoryRankingTotal = dashCategoryRanking.reduce((s, c) => s + c.total, 0);
 
   // Top-5 merchant contributors for one category, computed on demand when a ranking bar is expanded
-  // rather than pre-computed for every category up front.
+  // rather than pre-computed for every category up front. Nets refunds the same way the ranking above
+  // does, so a fully-refunded merchant doesn't show up in its category's top-5 at a phantom $150.
   function dashCategoryTopMerchants(category) {
     const totals = freshTally();
     dashWindowTxns.forEach(t => {
       if (classifyTxnKind(t, categoryBehaviors) !== "expense") return;
       if ((t.category || "Uncategorized") !== category) return;
       const m = t.merchant || "(no merchant)";
-      totals[m] = (totals[m] || 0) + Math.abs(t.amount);
+      totals[m] = (totals[m] || 0) - t.amount;
     });
     return Object.entries(totals).map(([merchant, total]) => ({ merchant, total: Math.round(total) }))
-      .sort((a, b) => b.total - a.total).slice(0, 5);
+      .filter(m => m.total > 0).sort((a, b) => b.total - a.total).slice(0, 5);
   }
   const [expandedRankingCategory, setExpandedRankingCategory] = useState(null);
 
@@ -3723,7 +3783,8 @@ export default function Ledger() {
   // "Fixed" = merchants detectRecurring already flags as recurring across full history (reused as-is,
   // see `recurring` below) - a bill/subscription is fixed by how regularly it repeats, not by which
   // category it happens to be filed under. Everything else that's an expense in the current window is
-  // discretionary.
+  // discretionary. Investment contributions are excluded automatically (classifyTxnKind returns
+  // "investment", not "expense", for them) same as in the category ranking above.
   const recurring = useMemo(() => detectRecurring(transactions.filter(t => t.category && !NON_SPEND.has(t.category)), recurringConfig), [transactions, recurringConfig]);
   const dashFixedMerchants = useMemo(() => new Set(recurring.map(r => r.merchant)), [recurring]);
   const dashFixedVsDiscretionary = useMemo(() => {
@@ -3731,7 +3792,9 @@ export default function Ledger() {
     const fixedByMerchant = freshTally(), discByCategory = freshTally();
     dashWindowTxns.forEach(t => {
       if (classifyTxnKind(t, categoryBehaviors) !== "expense") return;
-      const amt = Math.abs(t.amount);
+      // Net (not Math.abs) - same refund-cancels-purchase reasoning as dashCategoryRanking above, so
+      // a refunded fixed bill or discretionary purchase doesn't inflate either side's total.
+      const amt = -t.amount;
       if (dashFixedMerchants.has(t.merchant)) {
         fixed += amt;
         fixedByMerchant[t.merchant] = (fixedByMerchant[t.merchant] || 0) + amt;
@@ -3741,8 +3804,11 @@ export default function Ledger() {
         discByCategory[cat] = (discByCategory[cat] || 0) + amt;
       }
     });
-    const topFixed = Object.entries(fixedByMerchant).map(([merchant, total]) => ({ merchant, total: Math.round(total) })).sort((a, b) => b.total - a.total).slice(0, 5);
-    const topDiscretionary = Object.entries(discByCategory).map(([category, total]) => ({ category, total: Math.round(total) })).sort((a, b) => b.total - a.total).slice(0, 5);
+    // Filtered to total > 0 for the same reason dashCategoryRanking's entries are - now that amounts
+    // net instead of summing as magnitudes, a fully (or over-)refunded merchant/category can land at
+    // zero or negative, and doesn't belong in a "top spend" list.
+    const topFixed = Object.entries(fixedByMerchant).map(([merchant, total]) => ({ merchant, total: Math.round(total) })).filter(m => m.total > 0).sort((a, b) => b.total - a.total).slice(0, 5);
+    const topDiscretionary = Object.entries(discByCategory).map(([category, total]) => ({ category, total: Math.round(total) })).filter(c => c.total > 0).sort((a, b) => b.total - a.total).slice(0, 5);
     return { fixed: Math.round(fixed), discretionary: Math.round(discretionary), topFixed, topDiscretionary };
   }, [dashWindowTxns, dashFixedMerchants, categoryBehaviors]);
 
@@ -4325,7 +4391,7 @@ export default function Ledger() {
           <div>
             <div style={label}>High-level KPI summary</div>
             <p style={{ fontSize: "12px", color: "var(--text-secondary)", margin: "4px 0 0", maxWidth: "560px" }}>
-              Earned vs. spent for the selected timeframe and account(s), computed from each transaction's category type (income/expense/transfer) rather than raw amount sign - so a mis-signed row can't quietly skew the numbers.
+              Earned vs. spent vs. invested for the selected timeframe and account(s), computed from each transaction's category behavior (income/expense/investment/neutral) rather than raw amount sign - so a mis-signed row can't quietly skew the numbers. Lifestyle spend nets refunds against their original purchase instead of counting both as outflow.
             </p>
           </div>
           <span style={{ fontSize: "11px", color: "var(--text-muted)", whiteSpace: "nowrap" }}>{dashWindow.from} to {dashWindow.to}</span>
@@ -4337,19 +4403,25 @@ export default function Ledger() {
             <TrendBadge pct={dashEarnedTrendPct} goodDirection="up" />
           </div>
           <div style={card}>
-            <div style={label}>Total spent</div>
+            <div style={label}>Total lifestyle spend</div>
             <div style={statBig}>${dashTotalSpent.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+            <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "2px" }}>Net expenses (refunds netted out)</div>
             <TrendBadge pct={dashSpentTrendPct} goodDirection="down" />
           </div>
           <div style={card}>
-            <div style={label}>Net savings</div>
-            <div style={{ ...statBig, color: dashNetSavings >= 0 ? "var(--text-success)" : "var(--text-danger)" }}>${dashNetSavings.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
-            <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginTop: "4px" }}>{dashSavingsRatePct === null ? "n/a" : `${dashSavingsRatePct.toFixed(1)}% savings rate`}</div>
+            <div style={label}>Total invested</div>
+            <div style={{ ...statBig, color: "var(--text-accent)" }}>${dashTotalInvested.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+            <TrendBadge pct={dashInvestedTrendPct} goodDirection="up" />
           </div>
           <div style={card}>
-            <div style={label}>Avg daily spend</div>
-            <div style={statBig}>${dashAvgDailySpend.toLocaleString(undefined, { maximumFractionDigits: 2 })}</div>
-            <TrendBadge pct={dashAvgDailySpendTrendPct} goodDirection="down" />
+            <div style={label}>Net cash remaining</div>
+            <div style={{ ...statBig, color: dashNetCashRemaining >= 0 ? "var(--text-success)" : "var(--text-danger)" }}>${dashNetCashRemaining.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+            <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "2px" }}>Earned − spend − invested</div>
+          </div>
+          <div style={card}>
+            <div style={label}>Investment rate</div>
+            <div style={statBig}>{dashInvestmentRatePct === null ? "n/a" : `${dashInvestmentRatePct.toFixed(1)}%`}</div>
+            <div style={{ fontSize: "11px", color: "var(--text-muted)", marginTop: "2px" }}>Invested ÷ total earned</div>
           </div>
         </div>
       </div>
@@ -4384,6 +4456,43 @@ export default function Ledger() {
             </BarChart>
           </ResponsiveContainer>
         )}
+      </div>
+    ),
+    investments: (
+      <div style={card}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "10px", marginBottom: "12px" }}>
+          <div>
+            <div style={label}>Investments & Wealth Accumulation</div>
+            <p style={{ fontSize: "12px", color: "var(--text-secondary)", margin: "4px 0 0", maxWidth: "480px" }}>
+              Tracks money moved into investment accounts, wealth building, and long-term assets.
+            </p>
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <div style={label}>Total invested</div>
+            <div style={{ ...statBig, fontSize: "18px", color: "var(--text-accent)" }}>${dashTotalInvested.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+            <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>{dashInvestmentRatePct === null ? "n/a" : `${dashInvestmentRatePct.toFixed(1)}%`} investment rate</div>
+          </div>
+        </div>
+        {dashMonthlyInvestments.length === 0 ? (
+          <div style={{ fontSize: "13px", color: "var(--text-muted)", padding: "20px 0", textAlign: "center" }}>No investment contributions in this window.</div>
+        ) : (
+          <ResponsiveContainer width="100%" height={220}>
+            <BarChart data={dashMonthlyInvestments}>
+              <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+              <XAxis dataKey="month" tick={{ fontSize: 12 }} />
+              <YAxis tick={{ fontSize: 12 }} />
+              <Tooltip formatter={(v) => `$${v.toLocaleString()}`} />
+              <Bar dataKey="total" name="Contributions" fill="#378ADD" radius={[4, 4, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        )}
+        <div style={{ marginTop: "16px" }}>
+          <div style={{ fontSize: "11px", fontWeight: 600, color: "var(--text-secondary)", marginBottom: "6px" }}>Top investment destinations</div>
+          {dashTopInvestmentDestinations.length === 0 && <div style={{ fontSize: "12px", color: "var(--text-muted)" }}>None in this window.</div>}
+          {dashTopInvestmentDestinations.map(m => (
+            <div key={m.merchant} style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", padding: "3px 0" }}><span>{m.merchant}</span><span style={num}>${m.total.toLocaleString()}</span></div>
+          ))}
+        </div>
       </div>
     ),
     cumulativeNet: (
@@ -5393,7 +5502,7 @@ function SettingsTab({
 
       <div style={card}>
         <div style={{ ...label, marginBottom: "10px" }}>Manage categories</div>
-        <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 12px" }}>These are the spending categories offered in every dropdown. System categories (Income, Transfers, Review) aren't shown here since removing them would break the math elsewhere. Behavior controls how the Dashboard's totals treat each category - Expense counts toward spend, Income counts toward earnings, and Neutral (Excluded) counts toward neither (for internal transfers, refunds you don't want to double count, etc.).</p>
+        <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 12px" }}>These are the spending categories offered in every dropdown. System categories (Income, Transfers, Review) aren't shown here since removing them would break the math elsewhere. Behavior controls how the Dashboard's totals treat each category - Expense counts toward lifestyle spend (net of refunds), Income counts toward earnings, Investment counts toward the dedicated Investments & Wealth Accumulation tracking instead of ordinary spend, and Neutral (Excluded) counts toward none of them (for internal transfers, refunds you don't want to double count, etc.).</p>
         <div style={{ display: "flex", gap: "8px", marginBottom: "14px", flexWrap: "wrap" }}>
           <input value={newCat} onChange={e => setNewCat(e.target.value)} placeholder="New category name" style={{ ...input, flex: 1, minWidth: "160px" }}
             onKeyDown={e => { if (e.key === "Enter" && addCategory(newCat, newCatBehavior)) setNewCat(""); }} />
