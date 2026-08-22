@@ -5,7 +5,7 @@
 // and default to a named "BMO Mastercard" account
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
-import { BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
+import { BarChart, Bar, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
 import { Upload, Download, Plus, AlertCircle, Check, Copy, ChevronDown, ChevronUp, Trash2, Settings, FolderOpen, Sun, Moon, X, Pencil, Undo2, Printer, ArrowUp, ArrowDown, LayoutGrid, Split, Merge, Cloud, UploadCloud, DownloadCloud, LogOut, Loader2, Lock, Fingerprint, Delete, KeyRound } from "lucide-react";
 
 // System categories drive core calculations (savings tracking, income totals, transfer exclusion) -
@@ -32,6 +32,25 @@ const DEFAULT_SPENDING_CATEGORIES = ["Giving","Groceries","Dining","Health","Pha
   "Utilities","Hardware"];
 const NON_SPEND = new Set(SYSTEM_CATEGORIES);
 const INCOME_CATS = new Set(["INCOME: Employment","INCOME: Benefits","INCOME: Reimbursement","INCOME: Resale"]);
+
+// --- Sign-resilient category classification (Dashboard Overhaul) ------------------------------
+// Classifies a transaction into "income" | "transfer" | "excluded" | "expense" by its category's
+// semantic prefix rather than raw amount sign alone, so an income row saved with the wrong sign (or a
+// transfer that was never really spend to begin with) doesn't quietly distort the Dashboard's totals.
+// Amount sign only gets the final word for a genuinely uncategorized row, since "no category yet"
+// isn't itself a category: a positive uncategorized amount reads as income, a negative one as spend.
+function classifyTxnKind(t) {
+  const cat = t.category || "";
+  if (cat.startsWith("TRANSFER:")) return "transfer";
+  if (cat.startsWith("EXCLUDE:") || cat.startsWith("REVIEW:")) return "excluded";
+  if (cat.startsWith("INCOME:")) return "income";
+  if (!t.category) return t.amount > 0 ? "income" : "expense";
+  return "expense";
+}
+// Always non-negative magnitudes built on classifyTxnKind, so a caller summing them never needs to
+// remember which raw sign convention a given category happens to use.
+function txnIncomeAmount(t) { return classifyTxnKind(t) === "income" ? Math.abs(t.amount) : 0; }
+function txnExpenseAmount(t) { return classifyTxnKind(t) === "expense" ? Math.abs(t.amount) : 0; }
 
 // --- v4.1 one-time data migration: fold the old "TRANSFER: Wealthsimple" category forward into the
 // new "Investing" spending category, wherever ledger data gets loaded from. Three small, independent
@@ -518,6 +537,56 @@ function isChequingLikeAccount(text) {
   return CHEQUING_ACCOUNT_HINT.test(text || "");
 }
 
+// --- Dashboard Overhaul: pill-based timeframe/account filters --------------------------------
+// Local YYYY-MM-DD (not toISODate's UTC round-trip) - these windows are anchored on the viewer's
+// "today", so they need local calendar semantics, not UTC's.
+function ymd(d) { return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; }
+
+const DASH_TIMEFRAMES = [
+  { id: "thisMonth", label: "This Month" },
+  { id: "last3", label: "Last 3M" },
+  { id: "last6", label: "Last 6M" },
+  { id: "ytd", label: "YTD" },
+  { id: "last12", label: "12 Months" },
+  { id: "all", label: "All Time" },
+];
+
+// Resolves a timeframe pill id to a concrete [from, to] date-string window, anchored on "today".
+// "all" spans from the earliest transaction on record instead of an arbitrary fixed date, so the
+// window is never wider than the data actually on hand.
+function resolveTimeframeWindow(tf, transactions) {
+  const now = new Date();
+  const to = ymd(now);
+  if (tf === "thisMonth") return { from: ymd(new Date(now.getFullYear(), now.getMonth(), 1)), to };
+  if (tf === "ytd") return { from: ymd(new Date(now.getFullYear(), 0, 1)), to };
+  if (tf === "last3") return { from: ymd(new Date(now.getFullYear(), now.getMonth() - 3, now.getDate() + 1)), to };
+  if (tf === "last6") return { from: ymd(new Date(now.getFullYear(), now.getMonth() - 6, now.getDate() + 1)), to };
+  if (tf === "last12") return { from: ymd(new Date(now.getFullYear(), now.getMonth() - 12, now.getDate() + 1)), to };
+  const dates = transactions.map(t => t.date).filter(Boolean).sort();
+  return { from: dates.length ? dates[0] : to, to };
+}
+
+// The immediately-preceding window of the same length, for the KPI grid's "vs previous period" trend -
+// "This Month" compares to last month, "Last 3M" compares to the 3 months before that, and so on.
+function resolvePreviousWindow({ from, to }) {
+  const fromD = new Date(`${from}T00:00:00`);
+  const toD = new Date(`${to}T00:00:00`);
+  const spanDays = Math.round((toD - fromD) / 86400000) + 1;
+  const prevTo = new Date(fromD); prevTo.setDate(prevTo.getDate() - 1);
+  const prevFrom = new Date(prevTo); prevFrom.setDate(prevFrom.getDate() - (spanDays - 1));
+  return { from: ymd(prevFrom), to: ymd(prevTo) };
+}
+
+// "Credit Cards" / "Chequing/Debit" reuse the same name-sniffing regexes CSV import already uses to
+// guess an account's type from its name, so the Dashboard's account buckets stay consistent with
+// whatever the app already believes about each account.
+function accountMatchesDashFilter(account, filter) {
+  if (filter === "all") return true;
+  if (filter === "credit") return CREDIT_ACCOUNT_HINT.test(account || "");
+  if (filter === "chequing") return isChequingLikeAccount(account || "");
+  return account === filter;
+}
+
 // Some exports (BMO among them) put an account summary, a disclaimer, or a blank spacer row above
 // the real column header row, so Row 0 isn't reliably the header - these three functions locate the
 // real one instead of assuming it. A row counts as "the header" once at least two of its cells
@@ -974,12 +1043,13 @@ function milestoneColor(m) {
 // to build the default order below). Adding a new dashboard section in a future version means adding
 // one entry here; normalizeDashboardLayout (below) then folds it into any already-saved layout.
 const DASHBOARD_SECTIONS = [
-  { id: "summaryCards", label: "Summary metric cards" },
-  { id: "trendLine", label: "Monthly spend vs. income trend line" },
+  { id: "summaryCards", label: "KPI summary grid (earned, spent, net savings, avg daily spend)" },
+  { id: "trendLine", label: "Monthly cash flow trend (income vs. spending)" },
+  { id: "categoryBar", label: "Category spending breakdown & ranking" },
+  { id: "fixedVsDiscretionary", label: "Fixed vs. discretionary cost breakdown" },
   { id: "cumulativeNet", label: "Cumulative net position area chart" },
   { id: "spendSharePie", label: "Spend share pie chart" },
   { id: "incomeBar", label: "Income by source bar chart" },
-  { id: "categoryBar", label: "Category spend vertical bar chart" },
   { id: "recurringBills", label: "Recurring bills detected table" },
 ];
 const DASHBOARD_SECTION_IDS = new Set(DASHBOARD_SECTIONS.map(s => s.id));
@@ -1538,6 +1608,38 @@ function CategoryBadge({ category }) {
 function AccountBadge({ account }) {
   if (!account) return <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>—</span>;
   return <span style={{ background: "var(--surface-2)", color: "var(--text-secondary)", fontSize: "11px", padding: "2px 8px", borderRadius: "999px", whiteSpace: "nowrap", border: "1px solid var(--border)" }}>{account}</span>;
+}
+
+// KPI grid's "vs. previous period" trend indicator. Which direction counts as "good" is passed in
+// rather than assumed from the sign of pct, since a rising trend is good for earnings but bad for
+// spend - goodDirection === "up" flips that reading between the two.
+function TrendBadge({ pct, goodDirection }) {
+  if (pct === null || pct === undefined || !Number.isFinite(pct)) return null;
+  const isUp = pct >= 0;
+  const isGood = goodDirection === "up" ? isUp : !isUp;
+  const Icon = isUp ? ArrowUp : ArrowDown;
+  return (
+    <div style={{ display: "inline-flex", alignItems: "center", gap: "3px", fontSize: "11px", color: isGood ? "var(--text-success)" : "var(--text-danger)", marginTop: "4px" }}>
+      <Icon size={11} /> {Math.abs(pct).toFixed(1)}% vs previous period
+    </div>
+  );
+}
+
+// Custom Recharts tooltip for the Monthly Cash Flow Trends chart - shows the exact Income, Outflow,
+// Net, and Savings Rate for the hovered month, rather than relying on the default tooltip's per-series
+// rows (which wouldn't have room for a derived value like Savings Rate).
+function CashFlowTooltip({ active, payload, label }) {
+  if (!active || !payload || !payload.length) return null;
+  const d = payload[0].payload;
+  return (
+    <div style={{ background: "var(--surface-1)", border: "1px solid var(--border)", borderRadius: "8px", padding: "8px 10px", fontSize: "12px", boxShadow: "0 2px 8px rgba(0,0,0,0.12)" }}>
+      <div style={{ fontWeight: 600, marginBottom: "4px" }}>{label}</div>
+      <div style={{ color: "var(--text-success)" }}>Income: ${d.income.toLocaleString()}</div>
+      <div>Outflow: ${d.expense.toLocaleString()}</div>
+      <div>Net: ${d.net.toLocaleString()}</div>
+      <div style={{ color: "var(--text-secondary)" }}>Savings rate: {d.savingsRate === null ? "n/a" : `${d.savingsRate}%`}</div>
+    </div>
+  );
 }
 
 // Shown when a CSV's headers don't obviously map to Date/Description/Merchant/Amount - lets the
@@ -3325,6 +3427,131 @@ export default function Ledger() {
     setDashPeriod("all"); setDashCustomFrom(""); setDashCustomTo(""); setExcludedCategories(new Set());
   }
 
+  // --- Dashboard Overhaul: pill-based timeframe + account controls -----------------------------
+  // Deliberately independent of dashPeriod/excludedCategories above - those still drive the legacy
+  // cumulativeNet/spendSharePie/incomeBar/recurringBills sections unchanged. These two feed only the
+  // four widgets below (KPI grid, cash flow trend, category ranking, fixed vs. discretionary), which
+  // read sign-resilient totals via classifyTxnKind rather than raw category/sign filtering.
+  const [dashTimeframe, setDashTimeframe] = useState("last6");
+  const [dashAccountFilter, setDashAccountFilter] = useState("all");
+
+  const dashWindow = useMemo(() => resolveTimeframeWindow(dashTimeframe, transactions), [dashTimeframe, transactions]);
+  const dashPrevWindow = useMemo(() => resolvePreviousWindow(dashWindow), [dashWindow]);
+
+  const dashAccountTxns = useMemo(
+    () => transactions.filter(t => accountMatchesDashFilter(t.account, dashAccountFilter)),
+    [transactions, dashAccountFilter]
+  );
+  const dashWindowTxns = useMemo(
+    () => dashAccountTxns.filter(t => t.date >= dashWindow.from && t.date <= dashWindow.to),
+    [dashAccountTxns, dashWindow]
+  );
+  const dashPrevWindowTxns = useMemo(
+    () => dashAccountTxns.filter(t => t.date >= dashPrevWindow.from && t.date <= dashPrevWindow.to),
+    [dashAccountTxns, dashPrevWindow]
+  );
+
+  // --- Widget 1: High-level KPI summary grid -----------------------------------------------------
+  const dashTotalEarned = useMemo(() => dashWindowTxns.reduce((s, t) => s + txnIncomeAmount(t), 0), [dashWindowTxns]);
+  const dashTotalSpent = useMemo(() => dashWindowTxns.reduce((s, t) => s + txnExpenseAmount(t), 0), [dashWindowTxns]);
+  const dashNetSavings = dashTotalEarned - dashTotalSpent;
+  const dashSavingsRatePct = dashTotalEarned > 0 ? (dashNetSavings / dashTotalEarned) * 100 : null;
+  const dashWindowDays = Math.max(1, Math.round((new Date(`${dashWindow.to}T00:00:00`) - new Date(`${dashWindow.from}T00:00:00`)) / 86400000) + 1);
+  const dashAvgDailySpend = dashTotalSpent / dashWindowDays;
+
+  const dashPrevTotalEarned = useMemo(() => dashPrevWindowTxns.reduce((s, t) => s + txnIncomeAmount(t), 0), [dashPrevWindowTxns]);
+  const dashPrevTotalSpent = useMemo(() => dashPrevWindowTxns.reduce((s, t) => s + txnExpenseAmount(t), 0), [dashPrevWindowTxns]);
+  const dashPrevWindowDays = Math.max(1, Math.round((new Date(`${dashPrevWindow.to}T00:00:00`) - new Date(`${dashPrevWindow.from}T00:00:00`)) / 86400000) + 1);
+  const dashPrevAvgDailySpend = dashPrevTotalSpent / dashPrevWindowDays;
+
+  // Percent change vs. the prior equivalent window - null (rendered as "n/a") when there's nothing in
+  // the prior window to compare against, rather than a misleading "+Infinity%"/"0%".
+  function pctChange(current, previous) {
+    if (!(previous > 0)) return null;
+    return ((current - previous) / previous) * 100;
+  }
+  const dashEarnedTrendPct = dashTimeframe === "all" ? null : pctChange(dashTotalEarned, dashPrevTotalEarned);
+  const dashSpentTrendPct = dashTimeframe === "all" ? null : pctChange(dashTotalSpent, dashPrevTotalSpent);
+  const dashAvgDailySpendTrendPct = dashTimeframe === "all" ? null : pctChange(dashAvgDailySpend, dashPrevAvgDailySpend);
+
+  // --- Widget 2: Monthly cash flow trend -----------------------------------------------------------
+  const dashMonthlyCashFlow = useMemo(() => {
+    const byMonth = new Map();
+    dashWindowTxns.forEach(t => {
+      const m = t.date.slice(0, 7);
+      const kind = classifyTxnKind(t);
+      if (kind !== "income" && kind !== "expense") return;
+      const bucket = byMonth.get(m) || { month: m, income: 0, expense: 0 };
+      if (kind === "income") bucket.income += Math.abs(t.amount); else bucket.expense += Math.abs(t.amount);
+      byMonth.set(m, bucket);
+    });
+    return [...byMonth.values()].sort((a, b) => a.month.localeCompare(b.month)).map(m => ({
+      ...m,
+      income: Math.round(m.income),
+      expense: Math.round(m.expense),
+      net: Math.round(m.income - m.expense),
+      savingsRate: m.income > 0 ? Math.round(((m.income - m.expense) / m.income) * 1000) / 10 : null,
+    }));
+  }, [dashWindowTxns]);
+
+  // --- Widget 3: Category spending breakdown & ranking -----------------------------------------
+  const dashCategoryRanking = useMemo(() => {
+    const totals = freshTally();
+    dashWindowTxns.forEach(t => {
+      if (classifyTxnKind(t) !== "expense") return;
+      const cat = t.category || "Uncategorized";
+      totals[cat] = (totals[cat] || 0) + Math.abs(t.amount);
+    });
+    const entries = Object.entries(totals).filter(([, total]) => total > 0);
+    const sum = entries.reduce((s, [, total]) => s + total, 0);
+    return entries.map(([category, total]) => ({
+      category, total: Math.round(total), pct: sum > 0 ? (total / sum) * 100 : 0,
+    })).sort((a, b) => b.total - a.total);
+  }, [dashWindowTxns]);
+  const dashCategoryRankingTotal = dashCategoryRanking.reduce((s, c) => s + c.total, 0);
+
+  // Top-5 merchant contributors for one category, computed on demand when a ranking bar is expanded
+  // rather than pre-computed for every category up front.
+  function dashCategoryTopMerchants(category) {
+    const totals = freshTally();
+    dashWindowTxns.forEach(t => {
+      if (classifyTxnKind(t) !== "expense") return;
+      if ((t.category || "Uncategorized") !== category) return;
+      const m = t.merchant || "(no merchant)";
+      totals[m] = (totals[m] || 0) + Math.abs(t.amount);
+    });
+    return Object.entries(totals).map(([merchant, total]) => ({ merchant, total: Math.round(total) }))
+      .sort((a, b) => b.total - a.total).slice(0, 5);
+  }
+  const [expandedRankingCategory, setExpandedRankingCategory] = useState(null);
+
+  // --- Widget 4: Fixed vs. discretionary cost breakdown -----------------------------------------
+  // "Fixed" = merchants detectRecurring already flags as recurring across full history (reused as-is,
+  // see `recurring` below) - a bill/subscription is fixed by how regularly it repeats, not by which
+  // category it happens to be filed under. Everything else that's an expense in the current window is
+  // discretionary.
+  const recurring = useMemo(() => detectRecurring(transactions.filter(t => t.category && !NON_SPEND.has(t.category)), recurringConfig), [transactions, recurringConfig]);
+  const dashFixedMerchants = useMemo(() => new Set(recurring.map(r => r.merchant)), [recurring]);
+  const dashFixedVsDiscretionary = useMemo(() => {
+    let fixed = 0, discretionary = 0;
+    const fixedByMerchant = freshTally(), discByCategory = freshTally();
+    dashWindowTxns.forEach(t => {
+      if (classifyTxnKind(t) !== "expense") return;
+      const amt = Math.abs(t.amount);
+      if (dashFixedMerchants.has(t.merchant)) {
+        fixed += amt;
+        fixedByMerchant[t.merchant] = (fixedByMerchant[t.merchant] || 0) + amt;
+      } else {
+        discretionary += amt;
+        const cat = t.category || "Uncategorized";
+        discByCategory[cat] = (discByCategory[cat] || 0) + amt;
+      }
+    });
+    const topFixed = Object.entries(fixedByMerchant).map(([merchant, total]) => ({ merchant, total: Math.round(total) })).sort((a, b) => b.total - a.total).slice(0, 5);
+    const topDiscretionary = Object.entries(discByCategory).map(([category, total]) => ({ category, total: Math.round(total) })).sort((a, b) => b.total - a.total).slice(0, 5);
+    return { fixed: Math.round(fixed), discretionary: Math.round(discretionary), topFixed, topDiscretionary };
+  }, [dashWindowTxns, dashFixedMerchants]);
+
   const dashboardTxns = useMemo(() => {
     let rows = transactions;
     if (dashPeriod === "custom") {
@@ -3355,8 +3582,6 @@ export default function Ledger() {
     return Object.entries(totals).map(([category, total]) => ({ category, total: Math.round(total) })).sort((a, b) => b.total - a.total);
   }, [dashboardTxns]);
 
-  const recurring = useMemo(() => detectRecurring(transactions.filter(t => t.category && !NON_SPEND.has(t.category)), recurringConfig), [transactions, recurringConfig]);
-
   const categoryShare = useMemo(() => {
     const sorted = [...categoryBreakdown].sort((a, b) => b.total - a.total);
     const top = sorted.slice(0, 6);
@@ -3382,7 +3607,6 @@ export default function Ledger() {
   }, [monthlyTrend]);
 
   const totalSpend = categoryBreakdown.reduce((s, c) => s + c.total, 0);
-  const totalIncome = dashboardTxns.filter(t => t.category && INCOME_CATS.has(t.category)).reduce((s, t) => s + t.amount, 0);
 
   // Income streams: each contributes a low/high monthly estimate (a fixed source just has low === high).
   const incLow = budget.incomeStreams.reduce((s, i) => s + (Number.isFinite(i.low) ? i.low : 0), 0);
@@ -3684,6 +3908,19 @@ export default function Ledger() {
     deselectAllTxns();
   }
 
+  // Bulk delete - same confirm() pattern as the single-row deleteTransaction, gated on the current
+  // selection regardless of which page(s) it spans (selectedTxnIds isn't paged).
+  function deleteSelectedTxns() {
+    const count = selectedTxnIds.size;
+    if (count === 0) return;
+    const ok = confirm(`Delete ${count} selected transaction${count !== 1 ? "s" : ""}? This can't be undone.`);
+    if (!ok) return;
+    if (editingTxnId !== null && selectedTxnIds.has(editingTxnId)) { setEditingTxnId(null); setEditDraft(null); }
+    if (splittingTxnId !== null && selectedTxnIds.has(splittingTxnId)) setSplittingTxnId(null);
+    setTransactions(prev => prev.filter(t => !selectedTxnIds.has(t.id)));
+    deselectAllTxns();
+  }
+
   // Empties the entire transaction log, gated behind DeleteAllConfirmModal rather than this app's
   // usual window.confirm() (see that component's comment). The autosave effect below mirrors
   // `transactions` into localStorage on every change, so an empty array here persists on its own -
@@ -3738,6 +3975,15 @@ export default function Ledger() {
     } else {
       setDateFrom(""); setDateTo(""); setQuickMonth("");
     }
+    setTab("log");
+  }
+
+  // Same idea as drillDownToLog above, but for the four Dashboard Overhaul widgets - those are scoped
+  // by dashWindow/dashTimeframe (the pill controls), not dashPeriod, so the Log's date range is set to
+  // match dashWindow's actual [from, to] instead.
+  function drillDownToLogWindow(category) {
+    setFilterCat(category && category !== "Uncategorized" ? category : "all");
+    setDateFrom(dashWindow.from); setDateTo(dashWindow.to); setQuickMonth("");
     setTab("log");
   }
 
@@ -3796,6 +4042,14 @@ export default function Ledger() {
     });
   }, [filteredTxns, sortKey, sortDir]);
 
+  // Gmail-style "select all matching" - the header checkbox only ever selects what's on the current
+  // page (toggleSelectAllVisible above), so this is the escape hatch for a filtered result set that
+  // spans more than one page: selects every id in sortedTxns (already filtered + sorted, just not
+  // paginated), independent of which page happens to be showing.
+  function selectAllMatchingTxns() {
+    setSelectedTxnIds(new Set(sortedTxns.map(t => t.id)));
+  }
+
   // Reset to page 1 whenever the filtered/sorted set or page size changes, so the pager never
   // silently strands the person on a now out-of-range page.
   useEffect(() => { setPage(1); }, [filterCat, filterAccount, dateFrom, dateTo, sortKey, sortDir, pageSize]);
@@ -3812,37 +4066,81 @@ export default function Ledger() {
     return sortedTxns.slice(start, start + pageSize);
   }, [sortedTxns, page, pageSize, totalPages]);
 
+  // Fixed/discretionary split as a percent of the two combined, for the proportion bar in the
+  // fixedVsDiscretionary widget below - 0% (an empty bar) rather than NaN when there's no spend yet.
+  const dashFixedDiscTotal = dashFixedVsDiscretionary.fixed + dashFixedVsDiscretionary.discretionary;
+  const dashFixedPct = dashFixedDiscTotal > 0 ? (dashFixedVsDiscretionary.fixed / dashFixedDiscTotal) * 100 : 0;
+
   // Dashboard section content, keyed by the same ids as DASHBOARD_SECTIONS/dashboardLayout - the
   // Dashboard tab below renders these in dashboardLayout's order, skipping any marked !visible. A
   // hidden section is never added to the DOM at all (not just visually hidden), so it's automatically
   // excluded from Print/PDF too (see PRINT_CSS) without any section-specific print styling needed.
   const dashboardSectionContent = {
     summaryCards: (
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: "12px" }}>
-        <div style={card}><div style={label}>Total spend</div><div style={{ ...statBig }}>${totalSpend.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div></div>
-        <div style={card}><div style={label}>Total income</div><div style={{ ...statBig, color: "var(--text-success)" }}>${totalIncome.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div></div>
-        <div style={card}>
-          <div style={label}>Transactions in view</div>
-          <div style={statBig}>{dashboardTxns.length}</div>
-          {dashboardTxns.length !== transactions.length && <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>of {transactions.length} total</div>}
+      <div style={card}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "10px", marginBottom: "14px" }}>
+          <div>
+            <div style={label}>High-level KPI summary</div>
+            <p style={{ fontSize: "12px", color: "var(--text-secondary)", margin: "4px 0 0", maxWidth: "560px" }}>
+              Earned vs. spent for the selected timeframe and account(s), computed from each transaction's category type (income/expense/transfer) rather than raw amount sign - so a mis-signed row can't quietly skew the numbers.
+            </p>
+          </div>
+          <span style={{ fontSize: "11px", color: "var(--text-muted)", whiteSpace: "nowrap" }}>{dashWindow.from} to {dashWindow.to}</span>
         </div>
-        <div style={card}><div style={label}>Pending review</div><div style={{ ...statBig, color: staging.length ? "var(--text-warning)" : "var(--text-success)" }}>{staging.length}</div></div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: "12px" }}>
+          <div style={card}>
+            <div style={label}>Total earned</div>
+            <div style={{ ...statBig, color: "var(--text-success)" }}>${dashTotalEarned.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+            <TrendBadge pct={dashEarnedTrendPct} goodDirection="up" />
+          </div>
+          <div style={card}>
+            <div style={label}>Total spent</div>
+            <div style={statBig}>${dashTotalSpent.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+            <TrendBadge pct={dashSpentTrendPct} goodDirection="down" />
+          </div>
+          <div style={card}>
+            <div style={label}>Net savings</div>
+            <div style={{ ...statBig, color: dashNetSavings >= 0 ? "var(--text-success)" : "var(--text-danger)" }}>${dashNetSavings.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+            <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginTop: "4px" }}>{dashSavingsRatePct === null ? "n/a" : `${dashSavingsRatePct.toFixed(1)}% savings rate`}</div>
+          </div>
+          <div style={card}>
+            <div style={label}>Avg daily spend</div>
+            <div style={statBig}>${dashAvgDailySpend.toLocaleString(undefined, { maximumFractionDigits: 2 })}</div>
+            <TrendBadge pct={dashAvgDailySpendTrendPct} goodDirection="down" />
+          </div>
+        </div>
       </div>
     ),
     trendLine: (
       <div style={card}>
-        <div style={{ ...label, marginBottom: "10px" }}>Monthly spend vs income</div>
-        <ResponsiveContainer width="100%" height={260}>
-          <LineChart data={monthlyTrend}>
-            <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-            <XAxis dataKey="month" tick={{ fontSize: 12 }} />
-            <YAxis tick={{ fontSize: 12 }} />
-            <Tooltip />
-            <Legend />
-            <Line type="monotone" dataKey="spend" stroke="#D85A30" strokeWidth={2} dot={false} />
-            <Line type="monotone" dataKey="income" stroke="#1D9E75" strokeWidth={2} dot={false} />
-          </LineChart>
-        </ResponsiveContainer>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "12px", marginBottom: "10px" }}>
+          <div>
+            <div style={label}>Monthly cash flow trends</div>
+            <p style={{ fontSize: "12px", color: "var(--text-secondary)", margin: "4px 0 0", maxWidth: "480px" }}>
+              Compares money earned vs. money spent month-by-month to track your net surplus or deficit. Hover a bar for the exact income, outflow, net, and savings rate.
+            </p>
+          </div>
+          <div style={{ display: "flex", gap: "18px", flexWrap: "wrap" }}>
+            <div style={{ textAlign: "right" }}><div style={label}>Total inflow</div><div style={{ ...statBig, fontSize: "18px", color: "var(--text-success)" }}>${dashTotalEarned.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div></div>
+            <div style={{ textAlign: "right" }}><div style={label}>Total outflow</div><div style={{ ...statBig, fontSize: "18px" }}>${dashTotalSpent.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div></div>
+            <div style={{ textAlign: "right" }}><div style={label}>Net cash flow</div><div style={{ ...statBig, fontSize: "18px", color: dashNetSavings >= 0 ? "var(--text-success)" : "var(--text-danger)" }}>${dashNetSavings.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div></div>
+          </div>
+        </div>
+        {dashMonthlyCashFlow.length === 0 ? (
+          <div style={{ fontSize: "13px", color: "var(--text-muted)", padding: "20px 0", textAlign: "center" }}>No transactions in this window.</div>
+        ) : (
+          <ResponsiveContainer width="100%" height={260}>
+            <BarChart data={dashMonthlyCashFlow}>
+              <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+              <XAxis dataKey="month" tick={{ fontSize: 12 }} />
+              <YAxis tick={{ fontSize: 12 }} />
+              <Tooltip content={<CashFlowTooltip />} />
+              <Legend />
+              <Bar dataKey="income" name="Income" fill="#1D9E75" radius={[4, 4, 0, 0]} />
+              <Bar dataKey="expense" name="Outflow" fill="#D85A30" radius={[4, 4, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        )}
       </div>
     ),
     cumulativeNet: (
@@ -3892,17 +4190,91 @@ export default function Ledger() {
     ),
     categoryBar: (
       <div style={card}>
-        <div style={{ ...label, marginBottom: "10px" }}>Spend by category</div>
-        <p style={{ fontSize: "11px", color: "var(--text-muted)", margin: "-6px 0 10px" }}>Click a bar to jump to those transactions in the Log.</p>
-        <ResponsiveContainer width="100%" height={Math.max(240, categoryBreakdown.length * 28)}>
-          <BarChart data={categoryBreakdown} layout="vertical" margin={{ left: 100 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-            <XAxis type="number" tick={{ fontSize: 12 }} />
-            <YAxis type="category" dataKey="category" tick={{ fontSize: 12 }} width={140} />
-            <Tooltip />
-            <Bar dataKey="total" fill="#D85A30" radius={[0, 4, 4, 0]} cursor="pointer" onClick={(data) => drillDownToLog(getChartField(data, "category"))} />
-          </BarChart>
-        </ResponsiveContainer>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "10px" }}>
+          <div>
+            <div style={label}>Category spending breakdown & ranking</div>
+            <p style={{ fontSize: "12px", color: "var(--text-secondary)", margin: "4px 0 0", maxWidth: "480px" }}>
+              Ranks your spending by category. Shows each category's total amount and percentage of overall spend. Click a category to see its top 5 merchant contributors.
+            </p>
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <div style={label}>Total category spend</div>
+            <div style={statBig}>${dashCategoryRankingTotal.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+            <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>across {dashCategoryRanking.length} active categor{dashCategoryRanking.length === 1 ? "y" : "ies"}</div>
+          </div>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: "10px", marginTop: "16px" }}>
+          {dashCategoryRanking.length === 0 && <div style={{ fontSize: "13px", color: "var(--text-muted)" }}>No expenses in this window.</div>}
+          {dashCategoryRanking.map(c => {
+            const expanded = expandedRankingCategory === c.category;
+            return (
+              <div key={c.category}>
+                <button type="button" onClick={() => setExpandedRankingCategory(expanded ? null : c.category)}
+                  style={{ display: "block", width: "100%", textAlign: "left", background: "none", border: "none", padding: 0, cursor: "pointer" }}
+                  title="Click to see top merchants in this category">
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", marginBottom: "4px", color: "var(--text-primary)" }}>
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: "4px", fontWeight: 500 }}>
+                      {expanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />} {c.category}
+                    </span>
+                    <span style={{ color: "var(--text-secondary)" }}><b style={num}>${c.total.toLocaleString()}</b> &nbsp;{c.pct.toFixed(1)}%</span>
+                  </div>
+                  <div style={{ height: "8px", borderRadius: "999px", background: "var(--surface-2)", overflow: "hidden" }}>
+                    <div style={{ width: `${Math.min(100, c.pct)}%`, height: "100%", background: "#D85A30" }} />
+                  </div>
+                </button>
+                {expanded && (
+                  <div style={{ margin: "6px 0 0 18px", padding: "10px 12px", background: "var(--surface-2)", borderRadius: "8px" }}>
+                    <div style={{ fontSize: "11px", fontWeight: 600, color: "var(--text-secondary)", marginBottom: "6px" }}>Top merchants</div>
+                    {dashCategoryTopMerchants(c.category).map(m => (
+                      <div key={m.merchant} style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", padding: "3px 0" }}>
+                        <span>{m.merchant}</span><span style={num}>${m.total.toLocaleString()}</span>
+                      </div>
+                    ))}
+                    <button type="button" style={{ ...btn, padding: "3px 10px", marginTop: "8px", fontSize: "11px" }} onClick={() => drillDownToLogWindow(c.category)}>View in Log</button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    ),
+    fixedVsDiscretionary: (
+      <div style={card}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "10px", marginBottom: "12px" }}>
+          <div>
+            <div style={label}>Fixed vs. discretionary cost breakdown</div>
+            <p style={{ fontSize: "12px", color: "var(--text-secondary)", margin: "4px 0 0", maxWidth: "480px" }}>
+              Separates regular recurring expenses and subscriptions from variable lifestyle purchases. "Fixed" merchants are the same ones detected as recurring bills below.
+            </p>
+          </div>
+          <div style={{ display: "flex", gap: "18px" }}>
+            <div style={{ textAlign: "right" }}><div style={label}>Fixed costs</div><div style={{ ...statBig, fontSize: "18px" }}>${dashFixedVsDiscretionary.fixed.toLocaleString()}</div></div>
+            <div style={{ textAlign: "right" }}><div style={label}>Discretionary</div><div style={{ ...statBig, fontSize: "18px" }}>${dashFixedVsDiscretionary.discretionary.toLocaleString()}</div></div>
+          </div>
+        </div>
+        {dashFixedDiscTotal > 0 && (
+          <div style={{ display: "flex", height: "14px", borderRadius: "999px", overflow: "hidden", marginBottom: "16px" }}>
+            <div style={{ width: `${dashFixedPct}%`, background: "#378ADD" }} title={`Fixed ${dashFixedPct.toFixed(0)}%`} />
+            <div style={{ width: `${100 - dashFixedPct}%`, background: "#BA7517" }} title={`Discretionary ${(100 - dashFixedPct).toFixed(0)}%`} />
+          </div>
+        )}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: "16px" }}>
+          <div>
+            <div style={{ fontSize: "11px", fontWeight: 600, color: "var(--text-secondary)", marginBottom: "6px" }}>Top fixed merchants</div>
+            {dashFixedVsDiscretionary.topFixed.length === 0 && <div style={{ fontSize: "12px", color: "var(--text-muted)" }}>None detected in this window.</div>}
+            {dashFixedVsDiscretionary.topFixed.map(m => (
+              <div key={m.merchant} style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", padding: "3px 0" }}><span>{m.merchant}</span><span style={num}>${m.total.toLocaleString()}</span></div>
+            ))}
+          </div>
+          <div>
+            <div style={{ fontSize: "11px", fontWeight: 600, color: "var(--text-secondary)", marginBottom: "6px" }}>Top discretionary categories</div>
+            {dashFixedVsDiscretionary.topDiscretionary.length === 0 && <div style={{ fontSize: "12px", color: "var(--text-muted)" }}>None in this window.</div>}
+            {dashFixedVsDiscretionary.topDiscretionary.map(c => (
+              <div key={c.category} style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", padding: "3px 0" }}><span>{c.category}</span><span style={num}>${c.total.toLocaleString()}</span></div>
+            ))}
+          </div>
+        </div>
       </div>
     ),
     recurringBills: (
@@ -4190,16 +4562,35 @@ export default function Ledger() {
                   </select>
                   <button style={{ ...btnPrimary, opacity: bulkCategory ? 1 : 0.5 }} disabled={!bulkCategory} onClick={applyBulkCategory}><Check size={14} /> Apply to {selectedTxnIds.size}</button>
                   <button style={{ ...btn, padding: "6px 12px" }} onClick={invertSelectedSigns}>Invert Sign (+/-)</button>
+                  <button style={{ ...btn, padding: "6px 12px", color: "var(--text-danger)", borderColor: "var(--border-danger)" }} onClick={deleteSelectedTxns}><Trash2 size={13} /> Delete {selectedTxnIds.size}</button>
                   <button style={{ ...btn, padding: "6px 12px" }} onClick={deselectAllTxns}><X size={13} /> Deselect all</button>
                 </div>
               </div>
+            )}
+            {/* Gmail-style multi-page selection banner: the header checkbox below only ever reaches
+                the current page (toggleSelectAllVisible), so once every row on this page is checked
+                and more matching rows exist on other pages, offer the one-click escalation to every
+                id in sortedTxns. Swaps to a confirmation once that escalation has been taken, so the
+                banner never claims there's more to select when there isn't. */}
+            {pagedTxns.length > 0 && pagedTxns.every(t => selectedTxnIds.has(t.id)) && sortedTxns.length > pagedTxns.length && (
+              sortedTxns.every(t => selectedTxnIds.has(t.id)) ? (
+                <div style={{ ...card, background: "var(--bg-accent)", borderColor: "var(--text-accent)", padding: "8px 16px", marginBottom: "10px", fontSize: "13px", color: "var(--text-accent)", textAlign: "center" }}>
+                  All {sortedTxns.length} matching transactions are selected.{" "}
+                  <button type="button" onClick={deselectAllTxns} style={{ background: "none", border: "none", color: "var(--text-accent)", fontWeight: 600, textDecoration: "underline", cursor: "pointer", padding: 0, font: "inherit" }}>Clear selection</button>
+                </div>
+              ) : (
+                <div style={{ ...card, background: "var(--bg-accent)", borderColor: "var(--text-accent)", padding: "8px 16px", marginBottom: "10px", fontSize: "13px", color: "var(--text-accent)", textAlign: "center" }}>
+                  All {pagedTxns.length} transactions on this page are selected.{" "}
+                  <button type="button" onClick={selectAllMatchingTxns} style={{ background: "none", border: "none", color: "var(--text-accent)", fontWeight: 600, textDecoration: "underline", cursor: "pointer", padding: 0, font: "inherit" }}>Select all {sortedTxns.length} matching transactions</button>
+                </div>
+              )
             )}
             <div style={{ overflowX: "auto" }}>
               <table style={{ width: "100%", borderCollapse: "collapse" }}>
                 <thead>
                   <tr>
                     <th style={{ ...th, width: "36px" }}>
-                      <input type="checkbox" title="Select all visible"
+                      <input type="checkbox" title="Select all on this page"
                         checked={pagedTxns.length > 0 && pagedTxns.every(t => selectedTxnIds.has(t.id))}
                         onChange={() => toggleSelectAllVisible(pagedTxns)} />
                     </th>
@@ -4306,6 +4697,37 @@ export default function Ledger() {
             </p>
           </div>
           <div className="ledger-no-print" style={card}>
+            <div style={label}>Timeframe</div>
+            <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px", marginBottom: "14px" }}>
+              {DASH_TIMEFRAMES.map(tf => (
+                <button key={tf.id} type="button" onClick={() => setDashTimeframe(tf.id)}
+                  style={{ ...btn, padding: "6px 14px", borderRadius: "999px",
+                    background: dashTimeframe === tf.id ? "var(--text-accent)" : "var(--surface-1)",
+                    color: dashTimeframe === tf.id ? "#fff" : "var(--text-primary)",
+                    border: dashTimeframe === tf.id ? "1px solid var(--text-accent)" : "1px solid var(--border-strong)" }}>
+                  {tf.label}
+                </button>
+              ))}
+            </div>
+            <div style={label}>Account</div>
+            <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" }}>
+              {[{ id: "all", label: "All Accounts" }, { id: "credit", label: "Credit Cards" }, { id: "chequing", label: "Chequing/Debit" },
+                ...knownAccounts.map(a => ({ id: a, label: a }))].map(opt => (
+                <button key={opt.id} type="button" onClick={() => setDashAccountFilter(opt.id)}
+                  style={{ ...btn, padding: "6px 14px", borderRadius: "999px",
+                    background: dashAccountFilter === opt.id ? "var(--text-accent)" : "var(--surface-1)",
+                    color: dashAccountFilter === opt.id ? "#fff" : "var(--text-primary)",
+                    border: dashAccountFilter === opt.id ? "1px solid var(--text-accent)" : "1px solid var(--border-strong)" }}>
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+            <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "12px 0 0" }}>
+              Drives the KPI summary, monthly cash flow trend, category ranking, and fixed vs. discretionary breakdown below - showing {dashWindow.from} to {dashWindow.to}.
+            </p>
+          </div>
+
+          <div className="ledger-no-print" style={card}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "12px" }}>
               <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", alignItems: "flex-end" }}>
                 <div>
@@ -4344,7 +4766,7 @@ export default function Ledger() {
               </div>
             </div>
             <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "10px 0 0" }}>
-              Summary cards, spend by category, spend share, and income by source reflect this filter. Trend, cumulative net position, and recurring bills always show full history. "Customize layout" controls which sections show (and in what order) both here and in Print/PDF; "Export summary" downloads a CSV of the category breakdown and monthly totals, or opens Print/Save PDF for a clean-margined summary page of your currently visible sections.
+              Spend share and income by source reflect this Period/Categories filter; cumulative net position and recurring bills always show full history. (KPI summary, cash flow trend, category ranking, and fixed vs. discretionary use the Timeframe/Account pills above instead.) "Customize layout" controls which sections show (and in what order) both here and in Print/PDF; "Export summary" downloads a CSV of the category breakdown and monthly totals, or opens Print/Save PDF for a clean-margined summary page of your currently visible sections.
             </p>
           </div>
 
