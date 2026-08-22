@@ -657,9 +657,11 @@ pick which file to restore from if a rollback is ever needed.
     local data than a bad backup file can. A decrypt failure (wrong passphrase, or a
     corrupted/foreign file) is caught on its own, *before* any validation runs, and alerted with a
     generic message rather than surfacing the raw crypto error — local data is untouched either way.
-  - Checked by build + lint only so far, same caveat as every Phase 4 item before it — not yet
-    exercised against a real Google Cloud OAuth client/Drive account in a running browser, and no
-    unit tests written yet for the encrypt/decrypt round-trip or the Drive REST helpers.
+  - **Live-verified against a real Google account**: unlike every other Phase 4 item so far, this one
+    has actually been exercised end-to-end in a running browser against a real Google Cloud OAuth
+    client and Drive account — connect, Sync Now, and Pull from Cloud all manually confirmed working,
+    not just build/lint-checked. No unit tests written yet for the encrypt/decrypt round-trip or the
+    Drive REST helpers, but the feature itself is confirmed functional, not merely plausible.
 
 - **v6.6 — "Phase 4 Item 4 follow-up" (Dual-Provider Cloud Sync — Google Drive + Dropbox).** *Current
   production version.*
@@ -698,11 +700,15 @@ pick which file to restore from if a rollback is ever needed.
     (staging is transient and never persisted — see §3's Staging rows subsection). Every other safety
     property from v6.5 (validate-before-apply, safe decrypt-failure handling) is provider-agnostic
     and applies identically to a Dropbox-sourced payload.
-  - Checked by build + lint only so far, same caveat as every Phase 4 item before it — not yet
-    exercised against a real Dropbox App Console app/account in a running browser (the redirect round
-    trip in particular has only been read-reviewed against Dropbox's documented OAuth/PKCE and Files
-    API shapes, not run live), and no unit tests written yet for the PKCE helpers or the Dropbox REST
-    helpers.
+  - **Verification is split by provider, not uniform across this version**: the Google Drive path
+    (provider toggle defaulting to Google, the shared encryption engine, Sync Now/Pull from Cloud) has
+    been live-verified against a real Google account (see v6.5's entry above). The Dropbox-specific
+    transport added in this version has **not** — `connectDropbox`/the PKCE redirect round trip/
+    `dropboxUploadVault`/`dropboxDownloadVault` are still only build- and lint-checked, and
+    read-reviewed against Dropbox's documented OAuth/PKCE and Files API shapes, not run live against a
+    real Dropbox App Console app/account. No unit tests written yet for the PKCE helpers or the
+    Dropbox REST helpers either. Treat the Dropbox side with the same "unverified" caveat every other
+    Phase 4 item still carries, independent of Google Drive's now-confirmed status.
 
 ---
 
@@ -718,13 +724,16 @@ live-browser Playwright smoke test with screenshots) is kept at `_archive/Ledger
 Phase 4 Items 1 through 4, the latter now spanning two versions (Transaction Splitting v6.2, Advanced
 Regex Rules Engine v6.3, Predictive Forecasting & Runway Analytics v6.4, Serverless Cloud Sync v6.5,
 Dual-Provider Cloud Sync v6.6) have been implemented and checked with `npm run build` and
-`npm run lint` only — none has had unit tests written yet (for `splitTransaction`/`mergeSplitGroup`;
+`npm run lint` — none has had unit tests written yet (for `splitTransaction`/`mergeSplitGroup`;
 `parseRegexRule`/`categorize`'s regex branch; `estimateMilestone`; v6.5's
 `encryptVaultPayload`/`decryptVaultPayload`/Drive REST helpers; or v6.6's PKCE/Dropbox REST helpers),
-nor a live-browser regression pass. All are still outstanding before this phase should be considered
-verified to the same bar as Phase 3. v6.5 and v6.6 in particular have never been run against a real
-Google Cloud OAuth client/Drive account or a real Dropbox App Console app/account — only build- and
-lint-checked, and read-reviewed against each provider's documented API shapes.
+nor a full live-browser regression pass across the whole app. **One exception**: Cloud Sync's Google
+Drive path (v6.5, and the shared engine/provider-toggle plumbing v6.6 added on top of it) has been
+manually live-verified — connect, Sync Now, and Pull from Cloud all confirmed working against a real
+Google Cloud OAuth client and Drive account, not just build/lint-checked. Everything else, including
+v6.6's Dropbox-specific transport (the PKCE redirect round trip, `dropboxUploadVault`/
+`dropboxDownloadVault`), remains build/lint-checked only and is still outstanding before this phase
+should be considered verified to the same bar as Phase 3.
 
 **Pre-existing `npm run lint` errors, unrelated to Phase 4:** `npm run lint` on the codebase as
 received at the start of Phase 4 Item 4 already reported 9 errors having nothing to do with cloud
