@@ -1,5 +1,6 @@
-// Version: 6.9.6 - Resilient staging duplicate detection (flag + checkbox, not silent exclude),
-// "Delete all transactions" (Log tab), and "Clear Cache & Hard Reset" (Settings > Storage & Cache)
+// Version: 6.9.7 - Multi-account tracking: optional Account field on every transaction, CSV
+// filename/content account auto-detect, staging/Manual Form account inputs, and a Log tab Account
+// column + filter
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
 import { BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
@@ -72,6 +73,11 @@ function isValidTransaction(t) {
     && (typeof t.merchant === "string" || typeof t.description === "string")
     && Number.isFinite(t.amount)
     && (t.category === null || t.category === undefined || typeof t.category === "string")
+    // account is optional and additive, same reasoning as splitParentId below - every pre-multi-
+    // account transaction simply won't have one, and that's a perfectly valid "unassigned" state,
+    // not something to migrate or backfill (see AccountBadge/the Log tab's Account filter, which
+    // both already treat a missing account as its own "unassigned" bucket rather than an error).
+    && (t.account === null || t.account === undefined || typeof t.account === "string")
     // splitParentId is optional and additive - old data simply won't have it, and a row that has
     // it is a "split child": one of two-or-more rows a single original transaction was divided
     // into across categories (see splitTransaction/mergeSplitGroup below). It's the id the parent
@@ -444,6 +450,26 @@ function looksLikeCreditCardFormat(rows) {
     const amt = parseFlexibleAmount(r.amount);
     return Number.isFinite(amt) && amt < 0 && CREDIT_CARD_PAYMENT_PATTERN.test(`${r.merchant || ""} ${r.description || ""}`);
   });
+}
+
+// Account auto-detect for a single uploaded CSV (handleCSV): checks the file's own name plus its
+// first few lines - some bank exports carry an account-type line ("Account Type,Visa Infinite", a
+// branch/product name, etc.) above the real column headers - for words that name a credit product
+// vs a chequing/debit product. "scotiabank" in the same text upgrades the generic guess to a
+// specifically-named account; without it, the generic name is returned so this doesn't invent a
+// bank the file never mentioned. Returns "" when neither pattern matches, meaning "no guess" - the
+// Account field is left for the person to fill in themselves rather than defaulting to something
+// arbitrary. Not run for "Select folder" (many files, potentially many different accounts at once)
+// or paste (no file to inspect at all).
+const CREDIT_ACCOUNT_HINT = /visa|mastercard|amex|credit/i;
+const CHEQUING_ACCOUNT_HINT = /chequing|checking|debit|savings/i;
+function guessAccountFromFile(filename, rawText) {
+  const topLines = (rawText || "").split("\n").slice(0, 5).join("\n");
+  const haystack = `${filename || ""}\n${topLines}`;
+  const isScotiabank = /scotiabank/i.test(haystack);
+  if (CREDIT_ACCOUNT_HINT.test(haystack)) return isScotiabank ? "Scotiabank Visa" : "Credit Card";
+  if (CHEQUING_ACCOUNT_HINT.test(haystack)) return isScotiabank ? "Scotiabank Chequing" : "Chequing";
+  return "";
 }
 
 // A lookup key wrapped in slashes with optional trailing flags (e.g. "/^uber\s*eats/i") is a regex
@@ -1201,6 +1227,10 @@ const LOCK_WEBAUTHN_KEY = "ledger:applock:webauthn:v1";
 // Per-browser UI preference, same non-financial-data reasoning as THEME_KEY - which ingestion mode
 // (Manual Form vs Bulk Paste) the Log tab shows once the person has picked one explicitly.
 const INGESTION_MODE_KEY = "ledger:ingestionmode:v1";
+// Remembers the Manual Transaction Form's last-used Account across sessions - most manual entries in
+// a row tend to be for the same account, so this saves re-typing it every time (see
+// ManualTransactionForm's `account` state).
+const LAST_ACCOUNT_KEY = "ledger:lastaccount:v1";
 
 // Mirrors base64UrlEncode above, in reverse - restores the standard base64 alphabet and re-pads with
 // "=" (base64url per RFC 4648 §5 omits padding) before handing off to the existing base64ToBuf. Needed
@@ -1412,6 +1442,14 @@ function CategoryBadge({ category }) {
   return <span style={{ background: bg, color: fg, fontSize: "11px", padding: "2px 8px", borderRadius: "999px", whiteSpace: "nowrap" }}>{category || "unmatched"}</span>;
 }
 
+// A transaction with no account is a normal, valid state (see isValidTransaction) - most existing
+// data predates multi-account tracking entirely - so this renders a plain dash rather than an
+// "unmatched"-style warning badge the way CategoryBadge does for a missing category.
+function AccountBadge({ account }) {
+  if (!account) return <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>—</span>;
+  return <span style={{ background: "var(--surface-2)", color: "var(--text-secondary)", fontSize: "11px", padding: "2px 8px", borderRadius: "999px", whiteSpace: "nowrap", border: "1px solid var(--border)" }}>{account}</span>;
+}
+
 // Shown when a CSV's headers don't obviously map to Date/Description/Merchant/Amount - lets the
 // person point at the actual columns instead of the upload silently failing or guessing wrong. The
 // "split Debit/Credit" toggle covers files that spread money-out/money-in across two columns
@@ -1608,6 +1646,12 @@ function todayDateString() {
 function ManualTransactionForm({ categories, lookup, addCategory, onStage, onAddDirect }) {
   const [date, setDate] = useState(() => todayDateString());
   const [description, setDescription] = useState("");
+  // Sticky across entries (not reset by resetForm below) and seeded from LAST_ACCOUNT_KEY, since
+  // manually entering several transactions in a row is usually for the same account - see the
+  // persist call in handleStage/handleAddDirect for when this actually gets saved.
+  const [account, setAccount] = useState(() => {
+    try { return window.localStorage.getItem(LAST_ACCOUNT_KEY) || ""; } catch { return ""; }
+  });
   // Tracks whether the person has picked a category themselves for the CURRENT description text - see
   // handleDescriptionChange below, which resets this back to false the moment description itself
   // changes (v6.9.2), so a manual pick never keeps pinning a category chosen for different words once
@@ -1667,7 +1711,13 @@ function ManualTransactionForm({ categories, lookup, addCategory, onStage, onAdd
     const magnitude = parseFloat(amountText);
     const amount = Number.isFinite(magnitude) ? (txnType === "expense" ? -Math.abs(magnitude) : Math.abs(magnitude)) : NaN;
     const desc = description.trim();
-    return { date, description: desc, merchant: desc, amount, category };
+    return { date, description: desc, merchant: desc, amount, category, account: account.trim() || null };
+  }
+
+  // Persists whatever account was actually used on a successful save, not on every keystroke - "last
+  // used" means the one that made it into a real transaction.
+  function rememberAccount() {
+    try { window.localStorage.setItem(LAST_ACCOUNT_KEY, account.trim()); } catch { /* non-critical UI pref - safe to lose */ }
   }
 
   function handleCategorySelect(value) {
@@ -1686,10 +1736,10 @@ function ManualTransactionForm({ categories, lookup, addCategory, onStage, onAdd
   }
 
   function handleStage() {
-    if (onStage(buildRow())) resetForm();
+    if (onStage(buildRow())) { rememberAccount(); resetForm(); }
   }
   function handleAddDirect() {
-    if (onAddDirect(buildRow())) resetForm();
+    if (onAddDirect(buildRow())) { rememberAccount(); resetForm(); }
   }
 
   return (
@@ -1702,6 +1752,10 @@ function ManualTransactionForm({ categories, lookup, addCategory, onStage, onAdd
         <div style={{ gridColumn: "span 2" }}>
           <div style={label}>Description</div>
           <input type="text" value={description} onChange={e => handleDescriptionChange(e.target.value)} placeholder="e.g. Uber Eats" style={input} />
+        </div>
+        <div>
+          <div style={label}>Account (optional)</div>
+          <input type="text" list="known-account-list" value={account} onChange={e => setAccount(e.target.value)} placeholder="e.g. Scotiabank Chequing" style={input} />
         </div>
       </div>
 
@@ -2014,6 +2068,7 @@ export default function Ledger() {
     try { window.localStorage.setItem(INGESTION_MODE_KEY, mode); } catch { /* non-critical UI pref - safe to lose */ }
   }
   const [filterCat, setFilterCat] = useState("all");
+  const [filterAccount, setFilterAccount] = useState("all");
   const [budget, setBudget] = useState(() => persisted.budget || DEFAULT_BUDGET);
   const [recurringConfig, setRecurringConfig] = useState(() => persisted.recurringConfig || DEFAULT_RECURRING_CONFIG);
   const [dashboardLayout, setDashboardLayout] = useState(() => persisted.dashboardLayout || DEFAULT_DASHBOARD_LAYOUT);
@@ -2026,6 +2081,11 @@ export default function Ledger() {
   const nextTargetId = useRef(computeNextId(budget.targetScenarios));
   const nextId = useRef(computeNextId(transactions));
   const allCategories = useMemo(() => [...spendingCategories, ...SYSTEM_CATEGORIES], [spendingCategories]);
+  // Every distinct account name actually in use, for the Account filter dropdown and the
+  // autosuggest datalists on the staging toolbar / Manual Transaction Form - there's no separate
+  // "list of accounts" to manage in Settings, an account exists purely by having been typed onto at
+  // least one transaction.
+  const knownAccounts = useMemo(() => [...new Set(transactions.map(t => t.account).filter(Boolean))].sort(), [transactions]);
 
   const nextStageId = useRef(0);
   const nextSkipId = useRef(0);
@@ -2046,6 +2106,12 @@ export default function Ledger() {
   // so it can go true/false across imports without silently overriding a choice already made.
   const [invertSigns, setInvertSigns] = useState(false);
   const [ccFormatDetected, setCcFormatDetected] = useState(false);
+  // The account every currently-staged row will be tagged with once committed (see commitStaging) -
+  // one field for the whole staging batch, not per-row, since a CSV/paste import is normally one
+  // statement from one account at a time. Plain in-session state, not persisted like
+  // ManualTransactionForm's account (a fresh import is more likely to be a different statement than
+  // a fresh manual entry is to be a different account).
+  const [stagingAccount, setStagingAccount] = useState("");
   // Tracks the ids committed by the most recent commitStaging batch (or null once undone/dismissed/
   // replaced by a newer import), so the Log tab can offer a one-click "Undo last import" that rolls
   // back exactly that batch - not "delete everything", and not tied to any particular file/paste source.
@@ -2526,7 +2592,12 @@ export default function Ledger() {
   // `invert` flips a successfully-parsed amount's sign before it reaches staging - used by the
   // "Invert Signs (Credit Card mode)" toggle. Applied after the finite-number check below, so it
   // can't turn an unparseable amount into a spuriously "valid" one.
-  function stageRows(rows, { invertSigns: invert = false } = {}) {
+  function stageRows(rows, { invertSigns: invert = false, account: accountOverride } = {}) {
+    // accountOverride lets a caller pass a just-computed value (see handleCSV, which detects and
+    // stages in the same call before the setStagingAccount() it also fires has actually committed
+    // to state) instead of always reading the stagingAccount closure, which would still be stale in
+    // that specific case.
+    const account = (accountOverride !== undefined ? accountOverride : stagingAccount).trim() || null;
     const cleaned = [];
     const failed = [];
     rows.forEach(r => {
@@ -2548,6 +2619,7 @@ export default function Ledger() {
         cleaned.push({
           stageId: nextStageId.current++, date, description: r.description,
           merchant, amount: invert ? -amount : amount, suggested: category, category: category || "", matched,
+          account, // see commitStaging - tagged here, not at commit time
         });
       } else {
         failed.push({ skipId: nextSkipId.current++, reason: issues.join("; "),
@@ -2584,11 +2656,14 @@ export default function Ledger() {
   // detection) rather than reading the stale pre-update value. Detection only ever turns the toggle
   // on, never off, so it can't silently undo a choice already made; ccFormatDetected just drives the
   // "detected" badge and is free to flip both ways across imports.
-  function stageRowsWithSignDetection(rows) {
+  // `accountOverride` is optional and passed straight through to stageRows - see handleCSV, the one
+  // caller that needs it (a just-detected account, staged before its own setStagingAccount() call
+  // has actually committed to state).
+  function stageRowsWithSignDetection(rows, accountOverride) {
     const detected = looksLikeCreditCardFormat(rows);
     setCcFormatDetected(detected);
     if (detected) setInvertSigns(true);
-    stageRows(rows, { invertSigns: invertSigns || detected });
+    stageRows(rows, { invertSigns: invertSigns || detected, account: accountOverride });
   }
 
   // Called from SkippedRowsDrawer once a skipped row's Date/Merchant/Amount/Category have all been
@@ -2601,6 +2676,7 @@ export default function Ledger() {
     setStaging(prev => [...prev, {
       stageId: nextStageId.current++, date: fixed.date, description: fixed.merchant,
       merchant: fixed.merchant, amount: fixed.amount, suggested, category: fixed.category, matched: fixed.category === suggested,
+      account: stagingAccount.trim() || null, // recovered rows came from the same CSV/paste batch
       isDuplicate: false, included: true, // already confirmed via confirmIfDuplicate above
     }]);
     setSkippedRows(prev => prev.filter(r => r.skipId !== skipId));
@@ -2657,7 +2733,22 @@ export default function Ledger() {
     };
   }
 
-  function handleCSV(file) {
+  // Account auto-detect (see guessAccountFromFile) needs the file's raw text, which Papa.parse's own
+  // result doesn't expose (only parsed rows). Read it with file.text() first, compute the guess
+  // synchronously from that, *then* parse - rather than reading the text in a parallel, unawaited
+  // .then() - so the guessed account can be handed straight to this same call's
+  // stageRowsWithSignDetection instead of racing its own setStagingAccount() (which wouldn't commit
+  // to state until a later render, and so would still read as empty if stageRows read it eagerly).
+  // Only guesses when stagingAccount is still empty, so re-uploading a second statement right after
+  // the first never silently overwrites whatever account the person already chose for this batch.
+  async function handleCSV(file) {
+    let guessedAccount = stagingAccount;
+    if (!stagingAccount) {
+      try {
+        guessedAccount = guessAccountFromFile(file.name, await file.text());
+        if (guessedAccount) setStagingAccount(guessedAccount);
+      } catch { /* best-effort - a failed read here just means no auto-guess, not an error */ }
+    }
     Papa.parse(file, {
       header: true, skipEmptyLines: true,
       error: (err) => alert("Could not read that CSV file: " + err.message),
@@ -2670,7 +2761,7 @@ export default function Ledger() {
         if (result.needsMapping) {
           setPendingMapping(result);
         } else {
-          stageRowsWithSignDetection(result.rows);
+          stageRowsWithSignDetection(result.rows, guessedAccount);
         }
       },
     });
@@ -2766,7 +2857,7 @@ export default function Ledger() {
     });
     const committed = toCommit.map(r => ({
       id: nextId.current++, date: r.date, description: r.description,
-      merchant: r.merchant, amount: r.amount, category: r.category || null,
+      merchant: r.merchant, amount: r.amount, category: r.category || null, account: r.account ?? null,
     }));
     if (corrections.size) {
       setLookup(prev => sortLookup([...corrections.entries(), ...prev.filter(([k]) => !corrections.has(k))]));
@@ -2828,6 +2919,7 @@ export default function Ledger() {
     setStaging(prev => [...prev, {
       stageId: nextStageId.current++, date: row.date, description: row.description,
       merchant: row.merchant, amount: row.amount, suggested, category: row.category, matched: true,
+      account: row.account ?? null,
       isDuplicate: false, included: true, // already confirmed via confirmIfDuplicate above
     }]);
     return true;
@@ -2845,7 +2937,7 @@ export default function Ledger() {
     }
     setTransactions(prev => [...prev, {
       id: nextId.current++, date: row.date, description: row.description, merchant: row.merchant,
-      amount: row.amount, category: row.category,
+      amount: row.amount, category: row.category, account: row.account ?? null,
     }]);
     return true;
   }
@@ -3280,7 +3372,7 @@ export default function Ledger() {
   function startTxnEdit(t) {
     setSplittingTxnId(null);
     setEditingTxnId(t.id);
-    setEditDraft({ date: t.date, merchant: t.merchant, amount: String(t.amount), category: t.category || "" });
+    setEditDraft({ date: t.date, merchant: t.merchant, amount: String(t.amount), category: t.category || "", account: t.account || "" });
   }
   function cancelTxnEdit() {
     setEditingTxnId(null);
@@ -3296,7 +3388,7 @@ export default function Ledger() {
       return;
     }
     const id = editingTxnId;
-    setTransactions(prev => prev.map(t => t.id === id ? { ...t, date, merchant, amount, category: editDraft.category || null } : t));
+    setTransactions(prev => prev.map(t => t.id === id ? { ...t, date, merchant, amount, category: editDraft.category || null, account: editDraft.account.trim() || null } : t));
     setEditingTxnId(null);
     setEditDraft(null);
   }
@@ -3365,7 +3457,7 @@ export default function Ledger() {
       id: nextId.current++,
       date: parent.date, description: parent.description, merchant: parent.merchant,
       amount: Math.round(p.amount * 100) / 100,
-      category: p.category,
+      category: p.category, account: parent.account,
       splitParentId: parent.id,
     }));
     setTransactions(prev => [...prev.filter(t => t.id !== parentId), ...children]);
@@ -3395,7 +3487,7 @@ export default function Ledger() {
     const merged = {
       id: nextId.current++,
       date: first.date, description: first.description, merchant: first.merchant,
-      amount: total, category: null,
+      amount: total, category: null, account: first.account,
     };
     const siblingIds = new Set(siblings.map(t => t.id));
     setTransactions(prev => [...prev.filter(t => !siblingIds.has(t.id)), merged]);
@@ -3571,10 +3663,11 @@ export default function Ledger() {
 
   const filteredTxns = useMemo(() => {
     let rows = filterCat === "all" ? transactions : transactions.filter(t => t.category === filterCat);
+    if (filterAccount !== "all") rows = rows.filter(t => t.account === filterAccount);
     if (dateFrom) rows = rows.filter(t => t.date >= dateFrom);
     if (dateTo) rows = rows.filter(t => t.date <= dateTo);
     return rows;
-  }, [transactions, filterCat, dateFrom, dateTo]);
+  }, [transactions, filterCat, filterAccount, dateFrom, dateTo]);
 
   const sortedTxns = useMemo(() => {
     const dir = sortDir === "asc" ? 1 : -1;
@@ -3591,11 +3684,11 @@ export default function Ledger() {
 
   // Reset to page 1 whenever the filtered/sorted set or page size changes, so the pager never
   // silently strands the person on a now out-of-range page.
-  useEffect(() => { setPage(1); }, [filterCat, dateFrom, dateTo, sortKey, sortDir, pageSize]);
+  useEffect(() => { setPage(1); }, [filterCat, filterAccount, dateFrom, dateTo, sortKey, sortDir, pageSize]);
   // Clear bulk selection when the underlying filtered set changes (not on sort/page-size, which
   // don't change what's included) - a selection built under one filter shouldn't silently carry
   // over and get applied to a different-looking result set.
-  useEffect(() => { setSelectedTxnIds(new Set()); }, [filterCat, dateFrom, dateTo]);
+  useEffect(() => { setSelectedTxnIds(new Set()); }, [filterCat, filterAccount, dateFrom, dateTo]);
   const totalPages = Math.max(1, Math.ceil(sortedTxns.length / pageSize));
   // Also clamp defensively if the set shrinks for some other reason (e.g. a backup restore) without
   // one of the deps above changing.
@@ -3738,6 +3831,13 @@ export default function Ledger() {
     <div className="ledger-root" data-theme={theme} style={{ fontFamily: "var(--font-sans)", color: "var(--text-primary)", background: "var(--surface-0)", maxWidth: "100%", padding: "4px" }}>
       <style>{THEME_CSS}</style>
       <style>{PRINT_CSS}</style>
+      {/* Shared account-name autosuggest, referenced by input[list] on the Manual Transaction Form,
+          the staging toolbar, and the Log tab's inline row editor - one always-mounted datalist
+          rather than three tab/mode-gated copies, so none of those inputs lose suggestions just
+          because the component that would've rendered their own local datalist isn't mounted right now. */}
+      <datalist id="known-account-list">
+        {knownAccounts.map(a => <option key={a} value={a} />)}
+      </datalist>
       <div className="ledger-no-print" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "18px", flexWrap: "wrap", gap: "10px" }}>
         <div>
           <h1 style={{ fontSize: "26px", fontWeight: 650, letterSpacing: "-0.02em", margin: 0 }}>Ledger</h1>
@@ -3839,6 +3939,11 @@ export default function Ledger() {
                     </span>
                   )}
                 </div>
+                <div style={{ marginTop: "10px", maxWidth: "260px" }}>
+                  <div style={label}>Account (applied to everything staged below)</div>
+                  <input type="text" list="known-account-list" value={stagingAccount} onChange={e => setStagingAccount(e.target.value)}
+                    placeholder="e.g. Scotiabank Visa" style={input} />
+                </div>
                 <div style={{ marginTop: "12px" }}>
                   <textarea value={pasteText} onChange={e => setPasteText(e.target.value)} placeholder={"Or paste rows, one per line: 2026-09-05\\tpos purchase\\tfizz\\t-23.73"} style={{ ...input, minHeight: "70px", fontFamily: "var(--font-mono)", fontSize: "12px" }} />
                   <button style={{ ...btnPrimary, marginTop: "8px" }} onClick={handlePasteAdd}><Plus size={14} /> Add pasted rows</button>
@@ -3926,6 +4031,10 @@ export default function Ledger() {
                   <option value="all">All categories</option>
                   {allCategories.map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
+                <select value={filterAccount} onChange={e => setFilterAccount(e.target.value)} style={{ ...input, width: "180px" }}>
+                  <option value="all">All accounts</option>
+                  {knownAccounts.map(a => <option key={a} value={a}>{a}</option>)}
+                </select>
                 <select value={quickMonth} onChange={e => applyQuickMonth(e.target.value)} style={{ ...input, width: "130px" }}>
                   <option value="">Month...</option>
                   {months.map(m => <option key={m} value={m}>{m}</option>)}
@@ -3972,6 +4081,7 @@ export default function Ledger() {
                     <th style={{ ...th, cursor: "pointer", userSelect: "none" }} onClick={() => handleHeaderSort("merchant")}>Merchant{sortIndicator("merchant")}</th>
                     <th style={{ ...th, textAlign: "right", cursor: "pointer", userSelect: "none" }} onClick={() => handleHeaderSort("amount")}>Amount{sortIndicator("amount")}</th>
                     <th style={th}>Category</th>
+                    <th style={th}>Account</th>
                     <th style={{ ...th, textAlign: "right" }}>Actions</th>
                   </tr>
                 </thead>
@@ -3980,7 +4090,7 @@ export default function Ledger() {
                     if (splittingTxnId === t.id) {
                       return (
                         <tr key={t.id}>
-                          <td style={{ ...td, ...card, border: "1px solid var(--border)" }} colSpan={6}>
+                          <td style={{ ...td, ...card, border: "1px solid var(--border)" }} colSpan={7}>
                             <SplitEditor txn={t} categories={allCategories} onSave={saveTxnSplit} onCancel={cancelTxnSplit} />
                           </td>
                         </tr>
@@ -4001,6 +4111,9 @@ export default function Ledger() {
                               {allCategories.map(c => <option key={c} value={c}>{c}</option>)}
                             </select>
                           </td>
+                          <td style={td}>
+                            <input type="text" list="known-account-list" value={editDraft.account} onChange={e => setEditDraft(d => ({ ...d, account: e.target.value }))} style={input} />
+                          </td>
                           <td style={{ ...td, textAlign: "right", whiteSpace: "nowrap" }}>
                             <button style={{ ...btn, padding: "4px 8px" }} onClick={saveTxnEdit} title="Save"><Check size={13} /></button>
                             <button style={{ ...btn, padding: "4px 8px", marginLeft: "6px" }} onClick={cancelTxnEdit} title="Cancel"><X size={13} /></button>
@@ -4020,6 +4133,7 @@ export default function Ledger() {
                         </td>
                         <td style={{ ...td, textAlign: "right", ...num, color: t.amount < 0 ? "var(--text-primary)" : "var(--text-success)" }}>{t.amount < 0 ? "-" : "+"}${Math.abs(t.amount).toFixed(2)}</td>
                         <td style={td}><CategoryBadge category={t.category} /></td>
+                        <td style={td}><AccountBadge account={t.account} /></td>
                         <td style={{ ...td, textAlign: "right", whiteSpace: "nowrap" }}>
                           <button style={{ ...btn, padding: "4px 8px" }} onClick={() => startTxnEdit(t)} title="Edit"><Pencil size={13} /></button>
                           {splitChild ? (
@@ -4033,7 +4147,7 @@ export default function Ledger() {
                     );
                   })}
                   {pagedTxns.length === 0 && (
-                    <tr><td colSpan={6} style={{ ...td, textAlign: "center", color: "var(--text-muted)" }}>No transactions match these filters.</td></tr>
+                    <tr><td colSpan={7} style={{ ...td, textAlign: "center", color: "var(--text-muted)" }}>No transactions match these filters.</td></tr>
                   )}
                 </tbody>
               </table>
