@@ -1,5 +1,5 @@
-// Version: 6.9.1 - Auto-Categorization Engine Fixes (dual raw/normalized regex test, stateless
-// regex flags, expanded Transport regex coverage, Manual Form live-suggestion reset)
+// Version: 6.9.2 - Dining no-space merchant coverage (Tim Hortons/Starbucks/McDonald's) & Manual
+// Form live-suggestion reset on description edit
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
 import { BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
@@ -411,6 +411,12 @@ const DEFAULT_LOOKUP = [
     "dave & buster's", "kernels popcorn", "treats bakery", "presse cafe", "pumpernickel's",
     "cobbs bread", "great canadian bagel", "bagel world", "manchu wok", "edo japan",
     "teriyaki experience", "thai express", "new york fries",
+    // Regex-shaped catch-all (v6.9.2) for the handful of highest-volume chains whose merchant strings
+    // routinely show up with no space at all ("timhortons", "timhorton") in addition to the spaced
+    // plain-text keys above ("tim hortons") - a plain substring key can't bridge that gap, since
+    // "tim hortons" is never a literal substring of "timhortons". `s?` on each covers the
+    // singular/plural merchant-string variants some POS systems emit (e.g. "tims").
+    "/timhortons?|tim\\s*hortons?|tims?|starbucks?|mcdonalds?/i",
   ]),
   ...seedRules("Transport", [
     "uber", "lyft", "go transit", "ttc", "oc transpo", "presto card", "metrolinx", "via rail",
@@ -1357,11 +1363,13 @@ function todayDateString() {
 function ManualTransactionForm({ categories, lookup, addCategory, onStage, onAddDirect }) {
   const [date, setDate] = useState(() => todayDateString());
   const [description, setDescription] = useState("");
-  // Tracks whether the person has picked a category themselves - once they have, the live suggestion
-  // below stops overriding it as they keep editing the description, the same "don't clobber a manual
-  // correction" rule commitStaging's upsert-on-correction logic already follows elsewhere. Modeled as a
-  // derived value (useMemo) rather than synced into its own state via an effect, so there's no
-  // setState-in-effect render cascade - category is just suggestedCategory until categoryTouched flips.
+  // Tracks whether the person has picked a category themselves for the CURRENT description text - see
+  // handleDescriptionChange below, which resets this back to false the moment description itself
+  // changes (v6.9.2), so a manual pick never keeps pinning a category chosen for different words once
+  // the description no longer matches what it was picked for; live suggestion resumes immediately.
+  // Modeled as a derived value (useMemo) rather than synced into its own state via an effect, so
+  // there's no setState-in-effect render cascade - category is just suggestedCategory until
+  // categoryTouched flips.
   const [manualCategory, setManualCategory] = useState("");
   const [categoryTouched, setCategoryTouched] = useState(false);
   const [addingCategory, setAddingCategory] = useState(false);
@@ -1396,6 +1404,18 @@ function ManualTransactionForm({ categories, lookup, addCategory, onStage, onAdd
   function resetToSuggested() {
     setManualCategory("");
     setCategoryTouched(false);
+  }
+
+  // v6.9.2: any edit to the description re-engages live auto-suggestion. A manual pick was made
+  // against a specific description text; once that text changes, the pick hasn't actually been
+  // re-confirmed against the new words, so it's cleared rather than silently kept pinned to text that
+  // no longer matches it. Handled in the onChange itself (not a useEffect keyed on `description`) so
+  // there's no extra render-cascade risk and no new entry in the pre-existing set-state-in-effect lint
+  // debt tracked in CONTEXT.md §5.
+  function handleDescriptionChange(value) {
+    setDescription(value);
+    setCategoryTouched(false);
+    setManualCategory("");
   }
 
   function buildRow() {
@@ -1436,7 +1456,7 @@ function ManualTransactionForm({ categories, lookup, addCategory, onStage, onAdd
         </div>
         <div style={{ gridColumn: "span 2" }}>
           <div style={label}>Description</div>
-          <input type="text" value={description} onChange={e => setDescription(e.target.value)} placeholder="e.g. Uber Eats" style={input} />
+          <input type="text" value={description} onChange={e => handleDescriptionChange(e.target.value)} placeholder="e.g. Uber Eats" style={input} />
         </div>
       </div>
 

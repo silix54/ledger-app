@@ -809,6 +809,27 @@ in §5 carries.
 - Verified the same way as the rest of v6.9: `npm run build` clean, `npm run lint` unchanged (still
   exactly the 9 pre-existing baseline errors).
 
+**v6.9.2 fix, on top of the above:** a real gap, not the "everything returns no match" scale it was
+initially reported as — direct testing of the committed v6.9.1 code confirmed `categorize()` still
+correctly matched every one of the original spot-check merchants (Transport/Dining/Groceries). The actual
+bug was narrower: `DEFAULT_LOOKUP`'s plain-text Dining key `"tim hortons"` (with a space) can never match
+a merchant string with no separator at all, like `"timhortons"` or `"TIMHORTONS #4821"`, since a plain key
+is matched as a literal substring — `"tim hortons"` is simply never a substring of `"timhortons"`. Fixed
+with one more regex-shaped `DEFAULT_LOOKUP` entry,
+`/timhortons?|tim\s*hortons?|tims?|starbucks?|mcdonalds?/i`, covering the no-space/no-separator variants
+for the highest-volume chains most likely to show up that way, alongside the existing spaced plain-text
+keys (kept, not replaced — harmless redundancy, same category either way). Also: `ManualTransactionForm`
+now resets `categoryTouched`/`manualCategory` the instant `description` itself changes (handled directly
+in the input's `onChange`, not a `useEffect`, to avoid both a render-cascade and adding to the
+pre-existing `set-state-in-effect` lint debt above) — a manual pick was made against specific description
+text, and once that text changes the pick hasn't been re-confirmed against the new words, so live
+suggestion resumes immediately rather than staying pinned. The v6.9.1 "blank-selection" guard
+(`hasManualCategory`) and the `Undo2` reset-to-suggested icon both stay, for the case where a category is
+picked and the description is *not* touched again afterward. Verified with a direct `categorize()` call
+(not just build/lint): `categorize("timhortons", [])` and `categorize("TIMHORTONS #4821", [])` both now
+return `{ category: "Dining", matched: true }`, alongside re-confirming the original three spot-checks
+still pass. `npm run build` clean; `npm run lint` unchanged (same 9 baseline errors).
+
 ---
 
 ## 4. Version Archive Index
@@ -1120,8 +1141,8 @@ pick which file to restore from if a rollback is ever needed.
 ## 5. Current State
 
 The current master component is **`src/Ledger.jsx`** — version comment
-`// Version: 6.9.1 - Auto-Categorization Engine Fixes (dual raw/normalized regex test, stateless
-regex flags, expanded Transport regex coverage, Manual Form live-suggestion reset)`,
+`// Version: 6.9.2 - Dining no-space merchant coverage (Tim Hortons/Starbucks/McDonald's) & Manual
+Form live-suggestion reset on description edit`,
 component export `export default function Ledger()`, rendered from `src/App.jsx`. The prior v6.1
 snapshot ("Final Phase 3," all Phase 3 roadmap items complete and verified — unit tests for every
 migration/validation function, a full regression suite across prior versions' features, and a
