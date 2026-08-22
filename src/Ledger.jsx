@@ -1,5 +1,5 @@
-// Version: 6.9.4 - Resilient CSV import: flexible date/amount parsing (multi-format dates,
-// currency-symbol/parentheses amounts, Debit/Credit columns) + a Skipped Rows review & recovery drawer
+// Version: 6.9.5 - Credit card sign inversion: Invert Signs toggle (with auto-detect) on CSV/paste
+// staging, plus a batch Invert Sign action for already-committed transactions in the Log tab
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
 import { BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
@@ -404,6 +404,19 @@ function combineDebitCredit(debitRaw, creditRaw) {
   if (!Number.isFinite(debitVal) && !Number.isFinite(creditVal)) return "";
   const amount = (Number.isFinite(creditVal) ? Math.abs(creditVal) : 0) - (Number.isFinite(debitVal) ? Math.abs(debitVal) : 0);
   return String(amount);
+}
+
+// Some credit card exports write purchases as positive and "payment received"/"bill payment" rows
+// (money going toward paying off the balance) as negative - the exact mirror image of this app's own
+// negative=money-out convention. A row whose merchant/description names itself as a payment *and*
+// carries a negative amount is a strong signal the whole file is in that inverted convention, so the
+// "Invert Signs" toggle can default to on for a person who might not think to flip it themselves.
+const CREDIT_CARD_PAYMENT_PATTERN = /payment|bill pmt|transit \d+/i;
+function looksLikeCreditCardFormat(rows) {
+  return rows.some(r => {
+    const amt = parseFlexibleAmount(r.amount);
+    return Number.isFinite(amt) && amt < 0 && CREDIT_CARD_PAYMENT_PATTERN.test(`${r.merchant || ""} ${r.description || ""}`);
+  });
 }
 
 // A lookup key wrapped in slashes with optional trailing flags (e.g. "/^uber\s*eats/i") is a regex
@@ -1973,6 +1986,14 @@ export default function Ledger() {
   // correction. See stageRows for what lands here and SkippedRowsDrawer for the recovery UI.
   const [skippedRows, setSkippedRows] = useState([]);
   const [skippedDrawerOpen, setSkippedDrawerOpen] = useState(false);
+  // "Credit Card mode": some card issuers export purchases as positive and payments-toward-the-
+  // balance as negative - the mirror image of this app's own negative=money-out convention. When on,
+  // every amount staged from a CSV/paste import is multiplied by -1 before it reaches staging. See
+  // looksLikeCreditCardFormat for the auto-detect heuristic that defaults this on for a file that
+  // looks like it needs it; ccFormatDetected only drives the "detected" badge, not the toggle itself,
+  // so it can go true/false across imports without silently overriding a choice already made.
+  const [invertSigns, setInvertSigns] = useState(false);
+  const [ccFormatDetected, setCcFormatDetected] = useState(false);
   // Tracks the ids committed by the most recent commitStaging batch (or null once undone/dismissed/
   // replaced by a newer import), so the Log tab can offer a one-click "Undo last import" that rolls
   // back exactly that batch - not "delete everything", and not tied to any particular file/paste source.
@@ -2450,7 +2471,10 @@ export default function Ledger() {
 
   const [importWarning, setImportWarning] = useState("");
 
-  function stageRows(rows) {
+  // `invert` flips a successfully-parsed amount's sign before it reaches staging - used by the
+  // "Invert Signs (Credit Card mode)" toggle. Applied after the finite-number check below, so it
+  // can't turn an unparseable amount into a spuriously "valid" one.
+  function stageRows(rows, { invertSigns: invert = false } = {}) {
     const cleaned = [];
     const failed = [];
     rows.forEach(r => {
@@ -2471,7 +2495,7 @@ export default function Ledger() {
         const { category, matched } = categorize(merchant, lookup);
         cleaned.push({
           stageId: nextStageId.current++, date, description: r.description,
-          merchant, amount, suggested: category, category: category || "", matched,
+          merchant, amount: invert ? -amount : amount, suggested: category, category: category || "", matched,
         });
       } else {
         failed.push({ skipId: nextSkipId.current++, reason: issues.join("; "),
@@ -2490,6 +2514,20 @@ export default function Ledger() {
     if (failed.length) setSkippedRows(prev => [...prev, ...failed]);
 
     setStaging(prev => [...prev, ...kept]);
+  }
+
+  // Every stageRows call site funnels through here instead of calling it directly, so the credit-
+  // card-format auto-detect (see looksLikeCreditCardFormat) runs once, in one place, on the actual
+  // rows about to be staged. `invertSigns` (component state) only updates for the *next* render, so
+  // this computes the effective flag for THIS call itself (current toggle state OR a fresh
+  // detection) rather than reading the stale pre-update value. Detection only ever turns the toggle
+  // on, never off, so it can't silently undo a choice already made; ccFormatDetected just drives the
+  // "detected" badge and is free to flip both ways across imports.
+  function stageRowsWithSignDetection(rows) {
+    const detected = looksLikeCreditCardFormat(rows);
+    setCcFormatDetected(detected);
+    if (detected) setInvertSigns(true);
+    stageRows(rows, { invertSigns: invertSigns || detected });
   }
 
   // Called from SkippedRowsDrawer once a skipped row's Date/Merchant/Amount/Category have all been
@@ -2570,7 +2608,7 @@ export default function Ledger() {
         if (result.needsMapping) {
           setPendingMapping(result);
         } else {
-          stageRows(result.rows);
+          stageRowsWithSignDetection(result.rows);
         }
       },
     });
@@ -2599,7 +2637,7 @@ export default function Ledger() {
           }
           remaining--;
           if (remaining === 0) {
-            if (allRows.length) stageRows(allRows);
+            if (allRows.length) stageRowsWithSignDetection(allRows);
             if (mappingNeeded.length) {
               alert(`${mappingNeeded.length} file(s) couldn't be auto-read (no recognizable Date/Amount columns): ${mappingNeeded.map(m => m.filename).join(", ")}. Everything else was staged - you can add those separately.`);
             }
@@ -2618,7 +2656,7 @@ export default function Ledger() {
       const parts = line.split(/\t|,(?=(?:[^"]*"[^"]*")*[^"]*$)/).map(s => s.trim());
       return { date: parts[0], description: parts[1], merchant: parts[2] || parts[1], amount: parts[3] };
     });
-    stageRows(rows);
+    stageRowsWithSignDetection(rows);
     if (truncated) setImportWarning(prev => `Pasted content was capped at ${MAX_PASTE_LINES.toLocaleString()} lines. ${prev}`.trim());
     setPasteText("");
   }
@@ -2631,7 +2669,7 @@ export default function Ledger() {
       merchant: (row[mapping.merchant] || row[mapping.description] || ""),
       amount: mapping.splitAmount ? combineDebitCredit(row[mapping.debit], row[mapping.credit]) : (row[mapping.amount] || ""),
     }));
-    stageRows(rows);
+    stageRowsWithSignDetection(rows);
     setPendingMapping(null);
   }
 
@@ -3350,6 +3388,18 @@ export default function Ledger() {
     deselectAllTxns();
   }
 
+  // Flips the sign of every selected transaction's amount in place - the fix for a batch that was
+  // imported with the wrong polarity (a credit card file staged without the Invert Signs toggle, or
+  // caught before it, see stageRowsWithSignDetection) after it's already in the permanent log.
+  // Symmetric with applyBulkCategory: no confirm() (running it twice on the same selection is its
+  // own undo), and clears the selection afterward so a stale selection can't be double-flipped by
+  // an accidental second click.
+  function invertSelectedSigns() {
+    if (selectedTxnIds.size === 0) return;
+    setTransactions(prev => prev.map(t => selectedTxnIds.has(t.id) ? { ...t, amount: -t.amount } : t));
+    deselectAllTxns();
+  }
+
   // Sets dateFrom/dateTo to the first/last day of the chosen YYYY-MM month in one step, as a
   // convenience on top of the two free-form date inputs.
   function applyQuickMonth(m) {
@@ -3688,6 +3738,17 @@ export default function Ledger() {
                   </label>
                   <span style={{ fontSize: "12px", color: "var(--text-muted)", alignSelf: "center" }}>Columns: Date, Description, Merchant, Amount (negative = money out) - or separate Debit/Credit columns. Dates and currency-formatted amounts ($, CAD, parentheses) are read flexibly. "Select folder" grabs every CSV inside it and skips anything already in your log.</span>
                 </div>
+                <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", marginTop: "10px" }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "12px", color: "var(--text-secondary)", cursor: "pointer" }}>
+                    <input type="checkbox" checked={invertSigns} onChange={e => setInvertSigns(e.target.checked)} />
+                    Invert amount signs (Credit Card mode)
+                  </label>
+                  {ccFormatDetected && (
+                    <span style={{ fontSize: "11px", color: "var(--text-accent)", background: "var(--bg-accent)", padding: "3px 8px", borderRadius: "999px" }}>
+                      Credit card format detected: amounts inverted to match standard expense accounting.
+                    </span>
+                  )}
+                </div>
                 <div style={{ marginTop: "12px" }}>
                   <textarea value={pasteText} onChange={e => setPasteText(e.target.value)} placeholder={"Or paste rows, one per line: 2026-09-05\\tpos purchase\\tfizz\\t-23.73"} style={{ ...input, minHeight: "70px", fontFamily: "var(--font-mono)", fontSize: "12px" }} />
                   <button style={{ ...btnPrimary, marginTop: "8px" }} onClick={handlePasteAdd}><Plus size={14} /> Add pasted rows</button>
@@ -3784,6 +3845,7 @@ export default function Ledger() {
                     {allCategories.map(c => <option key={c} value={c}>{c}</option>)}
                   </select>
                   <button style={{ ...btnPrimary, opacity: bulkCategory ? 1 : 0.5 }} disabled={!bulkCategory} onClick={applyBulkCategory}><Check size={14} /> Apply to {selectedTxnIds.size}</button>
+                  <button style={{ ...btn, padding: "6px 12px" }} onClick={invertSelectedSigns}>Invert Sign (+/-)</button>
                   <button style={{ ...btn, padding: "6px 12px" }} onClick={deselectAllTxns}><X size={13} /> Deselect all</button>
                 </div>
               </div>
