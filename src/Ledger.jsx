@@ -1,4 +1,4 @@
-// Version: 6.2 - Phase 4 Item 1 (Transaction Splitting)
+// Version: 6.3 - Phase 4 Item 2 (Advanced Regex Rules Engine)
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
 import { BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from "recharts";
@@ -68,6 +68,10 @@ function isSplitChild(t) {
   return Number.isFinite(t.splitParentId);
 }
 
+// A regex-shaped key (see REGEX_RULE_SHAPE) is still just a string, so it's already covered here
+// without any change - this deliberately doesn't also require it to compile. An invalid saved regex
+// is a "rule that never matches" (see categorize/parseRegexRule), not corrupt data to be rejected -
+// the same way the rest of this app prefers "falls back to a safe default" over "refuses to load."
 function isValidLookupEntry(e) {
   return Array.isArray(e) && e.length === 2 && typeof e[0] === "string" && typeof e[1] === "string";
 }
@@ -283,12 +287,51 @@ const MAX_IMPORT_BYTES = 25 * 1024 * 1024;
 const MAX_IMPORT_ROWS = 200000;
 const MAX_PASTE_LINES = 5000;
 
-// lookup is an array of [keySubstring, category] pairs, longest-key-first.
-// A transaction matches the FIRST key it contains, so more specific keys (e.g. "amazon.ca prime")
-// must be listed before broader ones (e.g. "amazon.ca") or the broad key wins by accident.
+// A lookup key wrapped in slashes with optional trailing flags (e.g. "/^uber\s*eats/i") is a regex
+// rule instead of a plain substring - detected by shape alone, not a stored flag, so the existing
+// [key, category] tuple doesn't need a new field and every pre-v6.3 key (which never starts with
+// "/") is automatically and correctly treated as plain text.
+const REGEX_RULE_SHAPE = /^\/(.*)\/([a-z]*)$/;
+function isRegexRuleKey(key) {
+  return typeof key === "string" && REGEX_RULE_SHAPE.test(key);
+}
+// Compiles a regex-shaped key, or returns null for anything that isn't shaped like one, or is shaped
+// like one but doesn't actually compile (e.g. an unbalanced "(" from a typo, or an invalid flag).
+// `new RegExp` throws SyntaxError on bad input - caught here so one malformed saved rule can never
+// crash categorization for every transaction that runs after it. Callers treat null exactly like "this
+// rule never matches" rather than trying to distinguish "not a regex" from "invalid regex" further.
+function parseRegexRule(key) {
+  if (typeof key !== "string") return null;
+  const m = REGEX_RULE_SHAPE.exec(key);
+  if (!m) return null;
+  try {
+    return new RegExp(m[1], m[2]);
+  } catch {
+    // Invalid pattern syntax is routine, expected user input here (not an environment failure worth
+    // logging like the other catches in this file) - silently treated as "never matches."
+    return null;
+  }
+}
+
+// lookup is an array of [key, category] pairs, longest-key-first (see sortLookup). A transaction
+// matches the FIRST key it hits, so more specific plain keys (e.g. "amazon.ca prime") must be listed
+// before broader ones (e.g. "amazon.ca") or the broad key wins by accident.
+//
+// A regex-shaped key (see REGEX_RULE_SHAPE above) is tested against the RAW merchant text, not the
+// normalized/lowercased text a plain substring key matches against - that's what lets the rule's own
+// flags (e.g. including or omitting /i) actually control case sensitivity, the way a hand-written
+// regex normally would. An invalid regex-shaped key just never matches (parseRegexRule already caught
+// the construction error) and categorization moves on to the next rule, rather than falling back to a
+// literal substring search for something like "/uber(/i" that could never usefully match anyway.
 function categorize(merchant, lookupEntries) {
+  const raw = String(merchant || "");
   const text = normalize(merchant);
   for (const [key, cat] of lookupEntries) {
+    if (isRegexRuleKey(key)) {
+      const regex = parseRegexRule(key);
+      if (regex && regex.test(raw)) return { category: cat, norm: key, matched: true };
+      continue;
+    }
     if (text.includes(key)) return { category: cat, norm: key, matched: true };
   }
   return { category: null, norm: text, matched: false };
@@ -1050,9 +1093,23 @@ export default function Ledger() {
   }
 
   // --- Merchant rule management (direct edit, not just via staging corrections) ---
+  // A regex-shaped key is stored exactly as typed, NOT run through normalize() - normalize lowercases,
+  // collapses whitespace, and turns "-" into " ", any one of which would silently corrupt a pattern
+  // (e.g. "-" inside a character class like [a-z] would become a literal space, breaking the range).
+  // Plain keys keep going through normalize() exactly as before.
   function addLookupRule(key, category) {
-    const norm = normalize(key);
-    if (!norm || !category) return false;
+    const trimmed = typeof key === "string" ? key.trim() : "";
+    if (!trimmed || !category) return false;
+    if (isRegexRuleKey(trimmed)) {
+      if (!parseRegexRule(trimmed)) {
+        alert("That regex pattern isn't valid (check for things like unbalanced parentheses or brackets) - fix the syntax before saving this rule.");
+        return false;
+      }
+      setLookup(prev => sortLookup([[trimmed, category], ...prev.filter(([k]) => k !== trimmed)]));
+      return true;
+    }
+    const norm = normalize(trimmed);
+    if (!norm) return false;
     setLookup(prev => sortLookup([[norm, category], ...prev.filter(([k]) => k !== norm)]));
     return true;
   }
@@ -2182,6 +2239,50 @@ export default function Ledger() {
   );
 }
 
+// Settings > Merchant rules > "Test regex rule": try a /pattern/flags rule against a sample merchant
+// string before committing it as a real rule above. Reuses isRegexRuleKey/parseRegexRule - the exact
+// functions categorize() and addLookupRule run - so whatever this box shows is exactly how the rule
+// would behave once saved, not a separate approximation of it.
+function RegexRuleTester() {
+  const [sample, setSample] = useState("");
+  const [pattern, setPattern] = useState("");
+
+  const trimmedPattern = pattern.trim();
+  const shaped = trimmedPattern !== "" && isRegexRuleKey(trimmedPattern);
+  const regex = shaped ? parseRegexRule(trimmedPattern) : null;
+  const invalidSyntax = shaped && !regex;
+  const match = regex ? regex.exec(sample) : null;
+
+  return (
+    <div style={{ ...card, background: "var(--surface-2)", marginBottom: "12px" }}>
+      <div style={{ ...label, marginBottom: "8px" }}>Test regex rule</div>
+      <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 10px" }}>
+        Try a pattern like <code style={{ fontFamily: "var(--font-mono)" }}>/^uber\s*eats/i</code> against a sample merchant string before adding it as a rule above.
+      </p>
+      <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "8px" }}>
+        <input value={sample} onChange={e => setSample(e.target.value)} placeholder="Sample merchant string (e.g. UBER   EATS TORONTO)" style={{ ...input, flex: 1, minWidth: "220px" }} />
+        <input value={pattern} onChange={e => setPattern(e.target.value)} placeholder="/pattern/flags" style={{ ...input, flex: 1, minWidth: "220px", fontFamily: "var(--font-mono)" }} />
+      </div>
+      {trimmedPattern === "" ? (
+        <div style={{ fontSize: "12px", color: "var(--text-muted)" }}>Enter a pattern wrapped in slashes, e.g. /costco/i, to test it.</div>
+      ) : !shaped ? (
+        <div style={{ fontSize: "12px", color: "var(--text-warning)" }}>Wrap the pattern in slashes (e.g. /costco/i) - as typed, this would be saved as a plain-text rule instead of a regex.</div>
+      ) : invalidSyntax ? (
+        <div style={{ fontSize: "12px", color: "var(--text-danger)" }}><AlertCircle size={13} style={{ verticalAlign: "-2px", marginRight: "4px" }} />Invalid regex syntax - this rule would never match anything if saved as-is.</div>
+      ) : (
+        <div style={{ fontSize: "12px", color: match ? "var(--text-success)" : "var(--text-secondary)" }}>
+          {match ? (
+            <>
+              <Check size={13} style={{ verticalAlign: "-2px", marginRight: "4px" }} />
+              Matches{match.length > 1 && <> - capture groups: {match.slice(1).map((g, i) => `$${i + 1}="${g ?? ""}"`).join(", ")}</>}
+            </>
+          ) : "No match against the sample string."}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SettingsTab({ spendingCategories, addCategory, renameCategory, removeCategory, lookup, allCategories, addLookupRule, updateLookupRuleCategory, removeLookupRule, recurringConfig, updateRecurringConfig, resetRecurringConfig }) {
   const [newCat, setNewCat] = useState("");
   const [editingCat, setEditingCat] = useState(null);
@@ -2190,9 +2291,12 @@ function SettingsTab({ spendingCategories, addCategory, renameCategory, removeCa
   const [newRuleKey, setNewRuleKey] = useState("");
   const [newRuleCat, setNewRuleCat] = useState("");
 
+  // Plain keys are already stored lowercased (normalize()), but a regex-shaped key (v6.3+) is kept
+  // exactly as typed so its pattern isn't corrupted - so the search itself needs to lowercase k here
+  // instead of assuming it already is.
   const filteredLookup = useMemo(() => {
     const q = ruleSearch.trim().toLowerCase();
-    return q ? lookup.filter(([k, c]) => k.includes(q) || c.toLowerCase().includes(q)) : lookup;
+    return q ? lookup.filter(([k, c]) => k.toLowerCase().includes(q) || c.toLowerCase().includes(q)) : lookup;
   }, [lookup, ruleSearch]);
 
   return (
@@ -2229,10 +2333,11 @@ function SettingsTab({ spendingCategories, addCategory, renameCategory, removeCa
 
       <div style={card}>
         <div style={{ ...label, marginBottom: "10px" }}>Merchant rules ({lookup.length})</div>
-        <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 12px" }}>Every merchant string the categorizer recognizes. Longer, more specific keys are always checked first automatically - you don't need to manage priority order.</p>
+        <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 12px" }}>Every merchant string the categorizer recognizes. Longer, more specific keys are always checked first automatically - you don't need to manage priority order. A key wrapped in slashes with optional flags (e.g. <code style={{ fontFamily: "var(--font-mono)" }}>/^uber\s*eats/i</code>) is matched as a regular expression instead of plain text.</p>
+        <RegexRuleTester />
         <input value={ruleSearch} onChange={e => setRuleSearch(e.target.value)} placeholder="Search rules..." style={{ ...input, marginBottom: "10px" }} />
         <div style={{ display: "flex", gap: "8px", marginBottom: "12px" }}>
-          <input value={newRuleKey} onChange={e => setNewRuleKey(e.target.value)} placeholder="Merchant text (e.g. costco)" style={{ ...input, flex: 1 }} />
+          <input value={newRuleKey} onChange={e => setNewRuleKey(e.target.value)} placeholder="Merchant text (e.g. costco) or /regex/flags" style={{ ...input, flex: 1 }} />
           <select value={newRuleCat} onChange={e => setNewRuleCat(e.target.value)} style={{ ...input, width: "200px" }}>
             <option value="">Category...</option>
             {allCategories.map(c => <option key={c} value={c}>{c}</option>)}

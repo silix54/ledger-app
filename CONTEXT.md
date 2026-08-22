@@ -252,6 +252,38 @@ Validated per-entry by `isValidLookupEntry` (`Array.isArray(e) && e.length === 2
 strings). New/corrected rules are **upserted** (a re-correction replaces the prior entry for the
 same normalized key), never duplicated.
 
+#### Regex Rules (v6.3+)
+
+A key wrapped in slashes with optional trailing flags — e.g. `"/^uber\\s*eats/i"` — is a **regex
+rule** instead of a plain substring, detected by shape alone (`REGEX_RULE_SHAPE`), not a stored flag.
+This means the `[key, category]` tuple shape above didn't need to change, and every pre-v6.3 key
+(which never starts with `/`) is automatically and correctly treated as plain text with no migration
+needed.
+
+- `categorize()` checks each key's shape and, for a regex-shaped one, compiles it (`parseRegexRule`)
+  and tests it against the **raw** merchant string — not the normalized/lowercased text a plain
+  substring key matches against — so the rule's own flags (e.g. including or omitting `/i`) fully
+  control case sensitivity, the way a hand-written regex normally would. Plain keys still match the
+  old way: case-insensitive substring, via both sides passing through `normalize()`.
+- `parseRegexRule` wraps `new RegExp(...)` in `try/catch`: invalid pattern syntax (unbalanced
+  parens/brackets, a bad flag) returns `null` rather than throwing, and a `null` result is treated
+  everywhere as "this rule never matches" — never a crash, never a fallback to a nonsensical literal
+  substring search on the `/pattern/flags` text itself.
+- `addLookupRule` stores a regex-shaped key **exactly as typed**, skipping `normalize()` for it —
+  normalize's lowercasing, whitespace-collapsing, and `-`→`" "` replacement would otherwise corrupt a
+  pattern (e.g. `-` inside a character class like `[a-z]` turning into a literal space). It also
+  rejects an unparseable pattern at save time with an alert, rather than silently persisting a rule
+  that can never match. Plain keys are unaffected — still normalized as before.
+- `isValidLookupEntry` is unchanged: a regex-shaped key is still just a string, so it's already valid
+  shape-wise. It deliberately does **not** additionally require the pattern to compile — an invalid
+  saved regex is "a rule that never matches," not corrupt data to reject on load, matching this app's
+  general preference for safe fallback over refusing to load.
+- Settings > Merchant rules has a "Test regex rule" box (`RegexRuleTester`) that runs a candidate
+  `/pattern/flags` string against a sample merchant string using the same `isRegexRuleKey`/
+  `parseRegexRule` functions `categorize()` and `addLookupRule` use, live-showing whether it matches
+  and any capture groups — so what's previewed there is exactly how the rule behaves once saved, not
+  a separate approximation of it.
+
 ### Spending Categories
 
 ```js
@@ -395,7 +427,7 @@ pick which file to restore from if a rollback is ever needed.
     split from v6.0's 2-column side-by-side grid into two independent full-width stacked sections,
     since v6.1 requires every section to be independently reorderable.
 
-- **v6.2 — "Phase 4 Item 1" (Transaction Splitting).** *Current production version.*
+- **v6.2 — "Phase 4 Item 1" (Transaction Splitting).**
   - **Split a transaction across categories**: new "Split" button (Log tab actions column, next to
     Edit/Delete) opens an inline row editor to divide one transaction's amount across two or more
     categories. Save is blocked until every part has a category and the parts sum to *exactly* the
@@ -412,21 +444,44 @@ pick which file to restore from if a rollback is ever needed.
     still rendered the default Vite demo) — fixed as a prerequisite so `npm run build` meaningfully
     exercises this file.
 
+- **v6.3 — "Phase 4 Item 2" (Advanced Regex Rules Engine).** *Current production version.*
+  - **Regex merchant matching**: a merchant lookup key wrapped in slashes with optional trailing
+    flags (e.g. `/^uber\s*eats/i`) is matched as a regular expression against the raw merchant text
+    instead of a plain case-insensitive substring. Detected by shape, not a stored flag or schema
+    change — see §3's Regex Rules subsection for the full `categorize()`/`parseRegexRule`/
+    `addLookupRule` breakdown.
+  - **Safety**: invalid regex syntax is caught at the `new RegExp(...)` call site
+    (`parseRegexRule`) and treated as "this rule never matches" everywhere — categorization can never
+    crash on a malformed saved rule, and saving a new one that doesn't compile is rejected up front
+    with an alert instead of persisting silently.
+  - **Rule Testing UI**: Settings > Merchant rules gained a "Test regex rule" box
+    (`RegexRuleTester`) — a sample-merchant input and a `/pattern/flags` input, live-showing whether
+    it matches and any capture groups, using the exact same matching functions the real rule engine
+    runs (not a separate approximation).
+  - **Persistence**: regex-shaped keys are stored verbatim, never run through `normalize()` (which
+    would otherwise corrupt a pattern — e.g. turning `-` inside `[a-z]` into a literal space).
+    `isValidLookupEntry`, the `STORAGE_KEY` autosave payload, and JSON export/import all already
+    treat a lookup key as an opaque string, so none needed a shape change to carry regex rules
+    through cleanly.
+  - Checked by build + lint only so far, same caveat as v6.2 — not yet exercised against real data in
+    a running browser, and no unit tests written yet for `parseRegexRule`/`categorize`'s regex branch.
+
 ---
 
 ## 5. Current State
 
 The current master component is **`src/Ledger.jsx`** — version comment
-`// Version: 6.2 - Phase 4 Item 1 (Transaction Splitting)`, component export
+`// Version: 6.3 - Phase 4 Item 2 (Advanced Regex Rules Engine)`, component export
 `export default function Ledger()`, rendered from `src/App.jsx`. The prior v6.1 snapshot ("Final
 Phase 3," all Phase 3 roadmap items complete and verified — unit tests for every migration/validation
 function, a full regression suite across prior versions' features, and a live-browser Playwright
 smoke test with screenshots) is kept at `_archive/Ledger_v6_1.jsx`.
 
-Phase 4 Item 1 (Transaction Splitting, v6.2) has been implemented and checked with `npm run build`
-and `npm run lint` only — it has **not** yet had unit tests written for the new
-`splitTransaction`/`mergeSplitGroup` logic, nor a live-browser regression pass. Both are still
-outstanding before this item should be considered verified to the same bar as Phase 3.
+Phase 4 Items 1 and 2 (Transaction Splitting v6.2, Advanced Regex Rules Engine v6.3) have been
+implemented and checked with `npm run build` and `npm run lint` only — neither has had unit tests
+written yet (for `splitTransaction`/`mergeSplitGroup`, or for `parseRegexRule`/`categorize`'s regex
+branch), nor a live-browser regression pass. All three are still outstanding before this phase should
+be considered verified to the same bar as Phase 3.
 
 Everything above — the no-backend constraint, the `STORAGE_KEY` autosave shape, `computeNextId`,
 the independent-idempotent-migration pattern, and the exact data schemas in §3 — should be treated
