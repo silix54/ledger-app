@@ -1,7 +1,7 @@
-// Version: 6.3 - Phase 4 Item 2 (Advanced Regex Rules Engine)
+// Version: 6.4 - Phase 4 Item 3 (Predictive Forecasting & Runway Analytics)
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
-import { BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from "recharts";
+import { BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
 import { Upload, Download, Plus, AlertCircle, Check, Copy, ChevronDown, Trash2, Settings, FolderOpen, Sun, Moon, X, Pencil, Undo2, Printer, ArrowUp, ArrowDown, LayoutGrid, Split, Merge } from "lucide-react";
 
 // System categories drive core calculations (savings tracking, income totals, transfer exclusion) -
@@ -377,6 +377,41 @@ function detectRecurring(transactions, config) {
     }
   });
   return results.sort((a, b) => b.count - a.count);
+}
+
+// --- Runway & Target Projections (v6.4) -----------------------------------------------------------
+// How many months of projected chart points to draw forward from "now" - the task calls for a
+// 12-24 month horizon, so 24 is picked to show the longer end without needing a user-facing control.
+const RUNWAY_PROJECTION_MONTHS = 24;
+
+// Projects a constant monthly surplus rate forward from "now" to find the calendar month a target
+// gap closes. A gap already <= 0 resolves immediately ("reached") with zero months needed. A
+// non-positive rate can never close a positive gap no matter how many months pass - rather than
+// producing an infinite or nonsensical month count, that's reported as "deficit" and left for the
+// caller to render as a clean status message instead of a date. `fromDate` is passed in (rather than
+// read internally) so every scenario in one render projects from the exact same "now" and a test can
+// pass a fixed date instead of depending on the real clock.
+function estimateMilestone(gap, monthlyRate, fromDate) {
+  if (gap <= 0) return { status: "reached", monthsNeeded: 0 };
+  if (!(monthlyRate > 0)) return { status: "deficit" };
+  const monthsNeeded = Math.ceil(gap / monthlyRate);
+  const date = new Date(fromDate.getFullYear(), fromDate.getMonth() + monthsNeeded, 1);
+  return { status: "projected", monthsNeeded, date };
+}
+function formatMonthYear(date) {
+  return date.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+}
+// Renders an estimateMilestone() result as the short status text/color the runway table shows -
+// kept as plain functions (not JSX) so the same mapping is trivially unit-testable.
+function formatMilestone(m) {
+  if (m.status === "reached") return "Already there";
+  if (m.status === "deficit") return "Deficit / No projection available";
+  return formatMonthYear(m.date);
+}
+function milestoneColor(m) {
+  if (m.status === "reached") return "var(--text-success)";
+  if (m.status === "deficit") return "var(--text-danger)";
+  return "var(--text-secondary)";
 }
 
 // The Dashboard's customizable sections - fixed vocabulary of ids the app knows how to render, each
@@ -1335,6 +1370,55 @@ export default function Ledger() {
     return { ...t, gap, perMonth, feasible };
   });
 
+  // --- Goal Runway & Projections (v6.4): historical monthly net surplus projected forward toward
+  // each target scenario. Deliberately reads monthlyTrend (already full-history, income - spend per
+  // calendar month present in the Log) rather than dashboardTxns, so this section's numbers don't
+  // quietly change if the Dashboard tab's own period/category filter happens to be narrowed - a
+  // budgeting projection should reflect the same "whole history" months as the trend line/cumulative
+  // net chart, not whatever slice is currently selected elsewhere.
+  const surplusHistory = useMemo(
+    () => monthlyTrend.map(m => ({ month: m.month, surplus: m.income - m.spend })),
+    [monthlyTrend]
+  );
+  // Averages over however many recent months actually exist (0 if there's no history yet) rather than
+  // requiring a full 3 or 6 months of data before showing anything.
+  const avgSurplus3mo = useMemo(() => {
+    const recent = surplusHistory.slice(-3);
+    return recent.length ? recent.reduce((s, m) => s + m.surplus, 0) / recent.length : 0;
+  }, [surplusHistory]);
+  const avgSurplus6mo = useMemo(() => {
+    const recent = surplusHistory.slice(-6);
+    return recent.length ? recent.reduce((s, m) => s + m.surplus, 0) / recent.length : 0;
+  }, [surplusHistory]);
+  // Which average rate drives the chart trajectory and the "primary" milestone column - the table
+  // below shows both rates' milestones regardless, so switching this never hides the other one.
+  const [runwayRateBasis, setRunwayRateBasis] = useState("6");
+  const runwayMonthlyRate = runwayRateBasis === "3" ? avgSurplus3mo : avgSurplus6mo;
+
+  // Per-scenario milestone estimates under both rates, all projected from the same "now" so they're
+  // directly comparable to each other and to the chart below.
+  const runwayProjections = useMemo(() => {
+    const now = new Date();
+    return budget.targetScenarios.map(t => {
+      const gap = t.amount - netPos;
+      return { ...t, gap, milestone3: estimateMilestone(gap, avgSurplus3mo, now), milestone6: estimateMilestone(gap, avgSurplus6mo, now) };
+    });
+  }, [budget.targetScenarios, netPos, avgSurplus3mo, avgSurplus6mo]);
+
+  // Month-by-month chart trajectory: current net position at month 0, then the selected rate applied
+  // linearly forward. A negative or zero rate still produces a perfectly valid (flat or declining)
+  // curve here - only the milestone *dates* above need the explicit deficit guard, since a linear
+  // projection itself never breaks or goes infinite.
+  const runwayChartData = useMemo(() => {
+    const now = new Date();
+    const points = [];
+    for (let i = 0; i <= RUNWAY_PROJECTION_MONTHS; i++) {
+      const d = new Date(now.getFullYear(), now.getMonth() + i, 1);
+      points.push({ month: d.toISOString().slice(0, 7), netWorth: Math.round(netPos + runwayMonthlyRate * i) });
+    }
+    return points;
+  }, [netPos, runwayMonthlyRate]);
+
   // --- Log tab: sorting, date-range filtering, pagination ---
   const [sortKey, setSortKey] = useState("date");
   const [sortDir, setSortDir] = useState("desc");
@@ -2226,6 +2310,82 @@ export default function Ledger() {
                 </tbody>
               </table>
             </div>
+          </div>
+
+          <div style={card}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px", flexWrap: "wrap", gap: "8px" }}>
+              <div style={label}>Goal runway & projections</div>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>Chart pace</span>
+                <select value={runwayRateBasis} onChange={e => setRunwayRateBasis(e.target.value)} style={{ ...input, width: "170px" }}>
+                  <option value="3">3-month average</option>
+                  <option value="6">6-month average</option>
+                </select>
+              </div>
+            </div>
+            <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 12px" }}>
+              Historical net monthly surplus (total income minus total spend, from logged transactions) projected forward from your current net position toward each target scenario above.
+            </p>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: "12px", marginBottom: "16px" }}>
+              <div>
+                <div style={label}>3-month avg surplus</div>
+                <div style={{ ...statSmall, color: avgSurplus3mo >= 0 ? "var(--text-success)" : "var(--text-danger)" }}>${avgSurplus3mo.toLocaleString(undefined, { maximumFractionDigits: 0 })}/mo</div>
+              </div>
+              <div>
+                <div style={label}>6-month avg surplus</div>
+                <div style={{ ...statSmall, color: avgSurplus6mo >= 0 ? "var(--text-success)" : "var(--text-danger)" }}>${avgSurplus6mo.toLocaleString(undefined, { maximumFractionDigits: 0 })}/mo</div>
+              </div>
+              <div>
+                <div style={label}>Current net position</div>
+                <div style={statSmall}>${netPos.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+              </div>
+            </div>
+
+            {surplusHistory.length === 0 ? (
+              <div style={{ fontSize: "13px", color: "var(--text-muted)" }}>No transaction history yet - log some income and spend to unlock runway projections.</div>
+            ) : (
+              <>
+                <ResponsiveContainer width="100%" height={280}>
+                  <AreaChart data={runwayChartData}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                    <XAxis dataKey="month" tick={{ fontSize: 11 }} />
+                    <YAxis tick={{ fontSize: 12 }} />
+                    <Tooltip formatter={(v) => `$${v.toLocaleString()}`} />
+                    <Area type="monotone" dataKey="netWorth" name="Projected net worth" stroke="#378ADD" fill="#378ADD" fillOpacity={0.15} strokeWidth={2} />
+                    {budget.targetScenarios.map((t, i) => (
+                      <ReferenceLine key={t.id} y={t.amount} stroke={PIE_COLORS[i % PIE_COLORS.length]} strokeDasharray="4 4"
+                        label={{ value: t.label, position: "insideTopRight", fontSize: 11, fill: PIE_COLORS[i % PIE_COLORS.length] }} />
+                    ))}
+                  </AreaChart>
+                </ResponsiveContainer>
+
+                <div style={{ overflowX: "auto", marginTop: "16px" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                    <thead>
+                      <tr>
+                        <th style={th}>Target</th>
+                        <th style={{ ...th, textAlign: "right" }}>Amount</th>
+                        <th style={{ ...th, textAlign: "right" }}>Gap</th>
+                        <th style={th}>Milestone (3-mo pace)</th>
+                        <th style={th}>Milestone (6-mo pace)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {runwayProjections.map(t => (
+                        <tr key={t.id}>
+                          <td style={td}>{t.label}</td>
+                          <td style={{ ...td, textAlign: "right", ...num }}>${t.amount.toLocaleString(undefined, { maximumFractionDigits: 0 })}</td>
+                          <td style={{ ...td, textAlign: "right", ...num }}>${Math.max(0, t.gap).toLocaleString(undefined, { maximumFractionDigits: 0 })}</td>
+                          <td style={{ ...td, color: milestoneColor(t.milestone3) }}>{formatMilestone(t.milestone3)}</td>
+                          <td style={{ ...td, color: milestoneColor(t.milestone6) }}>{formatMilestone(t.milestone6)}</td>
+                        </tr>
+                      ))}
+                      {runwayProjections.length === 0 && <tr><td colSpan={5} style={{ ...td, textAlign: "center", color: "var(--text-muted)" }}>No target scenarios yet - add one above to see a projected milestone date.</td></tr>}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}

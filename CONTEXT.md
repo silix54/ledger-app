@@ -1,8 +1,9 @@
 # Ledger — Project Context
 
 Personal budget & income manager. Single-file React component (`Ledger.jsx`), currently at
-**v6.1**, all of "Phase 3" complete. This document is the onboarding brief for whichever agent
-picks up Phase 4, and doubles as the project's own history.
+**v6.4**, "Phase 3" complete and "Phase 4" in progress (Items 1-3 implemented so far, unverified —
+see §5). This document is the onboarding brief for whichever agent picks up the rest of Phase 4, and
+doubles as the project's own history.
 
 ---
 
@@ -323,6 +324,42 @@ budget: {
 Validated by `isValidBudget`: numeric top-level keys checked against `BUDGET_NUMERIC_KEYS`, each
 array field checked (if present) against its item-level `isValidX` predicate.
 
+`netWorthItems` and `targetScenarios` are the only two fields the v6.4 Goal Runway & Projections
+section reads — it adds no new persisted fields of its own (see below).
+
+#### Goal Runway & Projections (v6.4+)
+
+New Budget-tab section, purely derived at render time — **nothing new is added to the persisted
+`budget` object or the `STORAGE_KEY` payload.** Every number it shows is recomputed from
+`transactions` and the existing `netWorthItems`/`targetScenarios` arrays on every render:
+
+- **Historical monthly surplus** (`surplusHistory`, `avgSurplus3mo`, `avgSurplus6mo`): built from the
+  Dashboard's existing full-history `monthlyTrend` (income − spend per calendar month present in the
+  Log), not from `dashboardTxns` — so this section's numbers can't quietly change if the Dashboard
+  tab's own period/category filter happens to be narrowed elsewhere. The 3-month and 6-month averages
+  are each computed over however many recent months actually exist (0 if there's no history yet)
+  rather than requiring a full window before showing anything.
+- **Current net position**: reuses the same `netPos` (sum of `netWorthItems` typed `"asset"` minus
+  those typed `"liability"`) the Net worth items card above it already computes — not a second,
+  independently-derived number.
+- **Milestone projection** (`estimateMilestone`, a pure module-level function): given a gap
+  (`target.amount - netPos`) and a monthly rate, returns one of three statuses rather than ever
+  computing an infinite or nonsensical date — `"reached"` (gap already ≤ 0), `"deficit"` (rate ≤ 0
+  and gap > 0 — rendered as "Deficit / No projection available"), or `"projected"` (a concrete
+  month/year, via `Math.ceil(gap / rate)` months forward from "now"). The runway table computes and
+  shows both the 3-month-pace and 6-month-pace milestone for every target scenario side by side.
+- **Projection chart**: a `recharts` `AreaChart` (`runwayChartData`) plotting current net position at
+  month 0, then `netPos + selectedRate * monthIndex` linearly forward for `RUNWAY_PROJECTION_MONTHS`
+  (24) months — a `<select>` next to the section header picks whether the 3-month or 6-month average
+  drives this trajectory and the chart's `ReferenceLine`s mark each target scenario's amount. A
+  negative or zero rate still draws a perfectly valid flat/declining curve here (a linear projection
+  never breaks or goes infinite) — only the milestone *dates* need the explicit deficit guard above.
+
+Because none of this is persisted, there was nothing to add to `isValidBudget`, `migrateBudget`, or
+JSON export/import — a JSON backup restored into an older app version simply won't show this section,
+and restoring it back into v6.4+ recomputes everything fresh from whatever `transactions`/
+`netWorthItems`/`targetScenarios` the backup carried.
+
 ### Recurring-Detection Config (v6.0+)
 
 ```js
@@ -444,7 +481,7 @@ pick which file to restore from if a rollback is ever needed.
     still rendered the default Vite demo) — fixed as a prerequisite so `npm run build` meaningfully
     exercises this file.
 
-- **v6.3 — "Phase 4 Item 2" (Advanced Regex Rules Engine).** *Current production version.*
+- **v6.3 — "Phase 4 Item 2" (Advanced Regex Rules Engine).**
   - **Regex merchant matching**: a merchant lookup key wrapped in slashes with optional trailing
     flags (e.g. `/^uber\s*eats/i`) is matched as a regular expression against the raw merchant text
     instead of a plain case-insensitive substring. Detected by shape, not a stored flag or schema
@@ -466,22 +503,44 @@ pick which file to restore from if a rollback is ever needed.
   - Checked by build + lint only so far, same caveat as v6.2 — not yet exercised against real data in
     a running browser, and no unit tests written yet for `parseRegexRule`/`categorize`'s regex branch.
 
+- **v6.4 — "Phase 4 Item 3" (Predictive Forecasting & Runway Analytics).** *Current production version.*
+  - **Goal Runway & Projections**: new Budget-tab section computing the historical 3-month and
+    6-month average net monthly surplus (income − spend, from `monthlyTrend`'s full transaction
+    history) and projecting it forward from the current net position (`netPos`, from
+    `netWorthItems`) toward each `targetScenarios` entry. See §3's Goal Runway & Projections
+    subsection for the full breakdown.
+  - **Milestone dates, not just gaps**: for each target scenario, shows the estimated month/year
+    it's reached under both the 3-month and 6-month pace side by side (`estimateMilestone`), instead
+    of only the static gap/feasibility the existing "Target scenarios" table already showed.
+  - **Projection chart**: a `recharts` `AreaChart` plotting projected net worth 24 months forward
+    under a user-selectable rate (3-mo or 6-mo average), with a `ReferenceLine` per target scenario.
+  - **Graceful deficit handling**: a zero or negative surplus rate never produces an infinite or
+    nonsensical date — the milestone renders as "Deficit / No projection available" instead — and
+    never breaks the chart curve, since a linear projection is well-defined (flat or declining) at
+    any rate.
+  - **Nothing new persisted**: this entire section is derived at render time from existing
+    `transactions`/`netWorthItems`/`targetScenarios` — no new `budget` field, no `isValidBudget` or
+    `migrateBudget` change, no JSON export/import change.
+  - Checked by build + lint only so far, same caveat as v6.2/v6.3 — not yet exercised against real
+    data in a running browser, and no unit tests written yet for `estimateMilestone`.
+
 ---
 
 ## 5. Current State
 
 The current master component is **`src/Ledger.jsx`** — version comment
-`// Version: 6.3 - Phase 4 Item 2 (Advanced Regex Rules Engine)`, component export
+`// Version: 6.4 - Phase 4 Item 3 (Predictive Forecasting & Runway Analytics)`, component export
 `export default function Ledger()`, rendered from `src/App.jsx`. The prior v6.1 snapshot ("Final
 Phase 3," all Phase 3 roadmap items complete and verified — unit tests for every migration/validation
 function, a full regression suite across prior versions' features, and a live-browser Playwright
 smoke test with screenshots) is kept at `_archive/Ledger_v6_1.jsx`.
 
-Phase 4 Items 1 and 2 (Transaction Splitting v6.2, Advanced Regex Rules Engine v6.3) have been
-implemented and checked with `npm run build` and `npm run lint` only — neither has had unit tests
-written yet (for `splitTransaction`/`mergeSplitGroup`, or for `parseRegexRule`/`categorize`'s regex
-branch), nor a live-browser regression pass. All three are still outstanding before this phase should
-be considered verified to the same bar as Phase 3.
+Phase 4 Items 1 through 3 (Transaction Splitting v6.2, Advanced Regex Rules Engine v6.3, Predictive
+Forecasting & Runway Analytics v6.4) have been implemented and checked with `npm run build` and
+`npm run lint` only — none has had unit tests written yet (for `splitTransaction`/`mergeSplitGroup`;
+`parseRegexRule`/`categorize`'s regex branch; or `estimateMilestone`), nor a live-browser regression
+pass. All are still outstanding before this phase should be considered verified to the same bar as
+Phase 3.
 
 Everything above — the no-backend constraint, the `STORAGE_KEY` autosave shape, `computeNextId`,
 the independent-idempotent-migration pattern, and the exact data schemas in §3 — should be treated
