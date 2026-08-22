@@ -1,4 +1,4 @@
-// Version: 6.6 - Phase 4 Item 4 follow-up (Dual-Provider Cloud Sync - Google Drive + Dropbox)
+// Version: 6.7 - Phase 5 Item 1 (Progressive Web App & Offline Caching Engine)
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
 import { BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
@@ -788,6 +788,19 @@ const THEME_CSS = `
 .ledger-root .ledger-tabs button:hover { background: var(--surface-2) !important; }
 @keyframes ledger-spin { to { transform: rotate(360deg); } }
 .ledger-root .ledger-spin { animation: ledger-spin 0.9s linear infinite; }
+
+/* Mobile touch & viewport polishing (v6.7) - scoped to touch/narrow contexts only, so the dense
+   desktop mouse UI (small icon buttons, tight table rows) is untouched. Applies a 44px minimum hit
+   target (the WCAG/Apple/Material baseline for a reliably tappable control) to every button and
+   table row, and keeps wide content (tables, the split editor) scrollable within its own container
+   instead of clipping or forcing the page itself to scroll horizontally. */
+@media (max-width: 780px), (pointer: coarse) {
+  .ledger-root button { min-height: 44px; }
+  .ledger-root .ledger-tabs button { min-height: 44px; padding: 12px 16px; }
+  .ledger-root table td, .ledger-root table th { padding: 10px 8px; }
+  .ledger-root table td button, .ledger-root table th button { min-width: 44px; }
+  .ledger-root input[type="checkbox"] { width: 20px; height: 20px; }
+}
 `;
 
 // Print stylesheet for the Dashboard's "Print / Save PDF" export. Standard print-one-section trick:
@@ -887,7 +900,7 @@ function SplitEditor({ txn, categories, onSave, onCancel }) {
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
         {parts.map(p => (
-          <div key={p.key} style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+          <div key={p.key} style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
             <select value={p.category} onChange={e => updatePart(p.key, "category", e.target.value)}
               style={{ ...input, width: "220px", borderColor: !p.category ? "var(--border-warning)" : "var(--border)" }}>
               <option value="">Choose category...</option>
@@ -2447,19 +2460,21 @@ export default function Ledger() {
     recurringBills: (
       <div style={card}>
         <div style={{ ...label, marginBottom: "10px" }}>Recurring bills detected</div>
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
-          <thead><tr><th style={th}>Merchant</th><th style={th}>Occurrences</th><th style={{ ...th, textAlign: "right" }}>Avg amount</th><th style={th}>Interval</th></tr></thead>
-          <tbody>
-            {recurring.slice(0, 10).map(r => (
-              <tr key={r.merchant}>
-                <td style={td}>{r.merchant}</td>
-                <td style={{ ...td, ...num }}>{r.count}</td>
-                <td style={{ ...td, textAlign: "right", ...num }}>${r.avgAmt.toFixed(2)}</td>
-                <td style={td}>{r.flag} (~{Math.round(r.avgInt)}d)</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead><tr><th style={th}>Merchant</th><th style={th}>Occurrences</th><th style={{ ...th, textAlign: "right" }}>Avg amount</th><th style={th}>Interval</th></tr></thead>
+            <tbody>
+              {recurring.slice(0, 10).map(r => (
+                <tr key={r.merchant}>
+                  <td style={td}>{r.merchant}</td>
+                  <td style={{ ...td, ...num }}>{r.count}</td>
+                  <td style={{ ...td, textAlign: "right", ...num }}>${r.avgAmt.toFixed(2)}</td>
+                  <td style={td}>{r.flag} (~{Math.round(r.avgInt)}d)</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
     ),
   };
@@ -2801,8 +2816,8 @@ export default function Ledger() {
             <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 12px" }}>A fixed, guaranteed source can use the same number for low and high. A variable one (e.g. irregular hours) can carry a real range.</p>
             <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
               {budget.incomeStreams.map(s => (
-                <div key={s.id} style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-                  <input value={s.label} onChange={e => updateIncomeStream(s.id, "label", e.target.value)} style={{ ...input, flex: 1 }} />
+                <div key={s.id} style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+                  <input value={s.label} onChange={e => updateIncomeStream(s.id, "label", e.target.value)} style={{ ...input, flex: 1, minWidth: "140px" }} />
                   <div style={{ width: "110px" }}>
                     <div style={{ ...label, marginBottom: "2px" }}>Low ($/mo)</div>
                     <input type="number" value={s.low} onChange={e => updateIncomeStream(s.id, "low", e.target.value)} style={input} />
@@ -2828,8 +2843,8 @@ export default function Ledger() {
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
               {budget.committedCosts.map(c => (
-                <div key={c.id} style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-                  <input value={c.label} onChange={e => updateCommittedCost(c.id, "label", e.target.value)} style={{ ...input, flex: 1 }} />
+                <div key={c.id} style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+                  <input value={c.label} onChange={e => updateCommittedCost(c.id, "label", e.target.value)} style={{ ...input, flex: 1, minWidth: "140px" }} />
                   <input type="number" value={c.amount} onChange={e => updateCommittedCost(c.id, "amount", e.target.value)} style={{ ...input, width: "120px" }} />
                   <button style={{ ...btn, padding: "6px" }} onClick={() => removeCommittedCost(c.id)}><Trash2 size={14} /></button>
                 </div>
@@ -2849,7 +2864,7 @@ export default function Ledger() {
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
               {budget.netWorthItems.map(i => (
-                <div key={i.id} style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                <div key={i.id} style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
                   <select value={i.type} onChange={e => updateNetWorthItem(i.id, "type", e.target.value)} style={{ ...input, width: "110px" }}>
                     <option value="asset">Asset</option>
                     <option value="liability">Liability</option>
@@ -3126,15 +3141,15 @@ function SettingsTab({
         <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 12px" }}>Every merchant string the categorizer recognizes. Longer, more specific keys are always checked first automatically - you don't need to manage priority order. A key wrapped in slashes with optional flags (e.g. <code style={{ fontFamily: "var(--font-mono)" }}>/^uber\s*eats/i</code>) is matched as a regular expression instead of plain text.</p>
         <RegexRuleTester />
         <input value={ruleSearch} onChange={e => setRuleSearch(e.target.value)} placeholder="Search rules..." style={{ ...input, marginBottom: "10px" }} />
-        <div style={{ display: "flex", gap: "8px", marginBottom: "12px" }}>
-          <input value={newRuleKey} onChange={e => setNewRuleKey(e.target.value)} placeholder="Merchant text (e.g. costco) or /regex/flags" style={{ ...input, flex: 1 }} />
+        <div style={{ display: "flex", gap: "8px", marginBottom: "12px", flexWrap: "wrap" }}>
+          <input value={newRuleKey} onChange={e => setNewRuleKey(e.target.value)} placeholder="Merchant text (e.g. costco) or /regex/flags" style={{ ...input, flex: 1, minWidth: "180px" }} />
           <select value={newRuleCat} onChange={e => setNewRuleCat(e.target.value)} style={{ ...input, width: "200px" }}>
             <option value="">Category...</option>
             {allCategories.map(c => <option key={c} value={c}>{c}</option>)}
           </select>
           <button style={btnPrimary} onClick={() => { if (addLookupRule(newRuleKey, newRuleCat)) { setNewRuleKey(""); setNewRuleCat(""); } }}><Plus size={14} /> Add</button>
         </div>
-        <div style={{ overflowY: "auto", maxHeight: "420px" }}>
+        <div style={{ overflowX: "auto", overflowY: "auto", maxHeight: "420px" }}>
           <table style={{ width: "100%", borderCollapse: "collapse" }}>
             <thead><tr><th style={th}>Merchant text</th><th style={th}>Category</th><th style={th}></th></tr></thead>
             <tbody>
