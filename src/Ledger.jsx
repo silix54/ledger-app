@@ -1,4 +1,4 @@
-// Version: 6.8 - Phase 5 Item 2 (Manual Ingestion Form & App Lock)
+// Version: 6.9 - Master Seed Auto-Categorization Dataset
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
 import { BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
@@ -19,9 +19,13 @@ const SYSTEM_CATEGORIES = ["TRANSFER: Credit Card Payment","TRANSFER: Internal/O
 const WEALTHSIMPLE_CATEGORY = "Investing";
 const LEGACY_WEALTHSIMPLE_CATEGORY = "TRANSFER: Wealthsimple";
 // Spending categories are freely editable - this is the default set, seeded from your audited history.
+// "Utilities" and "Hardware" (v6.9) were added alongside the Master Seed Auto-Categorization Dataset -
+// see ensureMasterSeedCategories below - since the dataset's Utilities/Hardware merchant buckets need
+// somewhere real to land that isn't a misleading fit for the pre-existing "Household" catch-all.
 const DEFAULT_SPENDING_CATEGORIES = ["Giving","Groceries","Dining","Health","Pharmacy","Subscriptions","Telecom","Gym",
   "Apparel & Gear","Online Marketplace","Transport","Shipping (US mailbox)","Education",
-  WEALTHSIMPLE_CATEGORY, "Convenience","Household","Personal Care","Events & Hobbies","Military","Debt Repayment","General Retail"];
+  WEALTHSIMPLE_CATEGORY, "Convenience","Household","Personal Care","Events & Hobbies","Military","Debt Repayment","General Retail",
+  "Utilities","Hardware"];
 const NON_SPEND = new Set(SYSTEM_CATEGORIES);
 const INCOME_CATS = new Set(["INCOME: Employment","INCOME: Benefits","INCOME: Reimbursement","INCOME: Resale"]);
 
@@ -37,6 +41,18 @@ function migrateWealthsimpleLookup(lookup) {
 }
 function ensureWealthsimpleCategory(spendingCategories) {
   return spendingCategories.includes(WEALTHSIMPLE_CATEGORY) ? spendingCategories : [...spendingCategories, WEALTHSIMPLE_CATEGORY];
+}
+
+// v6.9: same "additive, idempotent, safe on every load" pattern as ensureWealthsimpleCategory just
+// above - appends "Utilities"/"Hardware" for any browser whose saved spendingCategories predate the
+// Master Seed Auto-Categorization Dataset (see DEFAULT_LOOKUP below), so the dataset's built-in
+// Utilities/Hardware suggestions land on a category that actually exists in Settings and the category
+// filters, rather than a category string nothing else knows about. A no-op the moment both are already
+// present, so it's safe to run unconditionally on every load path, same as its Wealthsimple counterpart.
+const MASTER_SEED_CATEGORIES = ["Utilities", "Hardware"];
+function ensureMasterSeedCategories(spendingCategories) {
+  const missing = MASTER_SEED_CATEGORIES.filter(c => !spendingCategories.includes(c));
+  return missing.length ? [...spendingCategories, ...missing] : spendingCategories;
 }
 
 function normalize(s) {
@@ -232,7 +248,7 @@ function readPersistedStore() {
       _persistedCache.lookup = sortLookup(migrateWealthsimpleLookup(parsed.lookup));
     }
     if (Array.isArray(parsed.spendingCategories) && parsed.spendingCategories.every(c => typeof c === "string")) {
-      _persistedCache.spendingCategories = ensureWealthsimpleCategory(parsed.spendingCategories);
+      _persistedCache.spendingCategories = ensureMasterSeedCategories(ensureWealthsimpleCategory(parsed.spendingCategories));
     }
     if (parsed.budget && isValidBudget(parsed.budget)) {
       _persistedCache.budget = migrateBudget(parsed.budget);
@@ -313,6 +329,238 @@ function parseRegexRule(key) {
   }
 }
 
+// --- Master Seed Auto-Categorization Dataset (v6.9) -------------------------------------------------
+// A large built-in library of common North American merchant name substrings, grouped by category
+// below and flattened into DEFAULT_LOOKUP - an array of [key, category] tuples, the exact same shape
+// as a user's own `lookup` entries (see CONTEXT.md's Merchant Lookup section). This is Tier 2 of
+// categorize() below: consulted only once no rule in the person's own `lookup` matches, so it can
+// never override a user rule and never needs any precedence logic of its own. None of it is shown or
+// editable in Settings > Merchant rules, and none of it is ever written into `lookup`/STORAGE_KEY/JSON
+// export - it isn't the person's own data, just a built-in fallback categorize() consults. A merchant
+// this dataset gets wrong (or misses entirely) is a one-time "no match" the person corrects exactly
+// like any other suggestion - that correction becomes a real Tier 1 `lookup` rule and permanently wins
+// over this dataset for that merchant from then on.
+//
+// seedRules() is a plain data-entry helper, not part of the matching logic - it just spreads one
+// category label across many keys so the (large) lists below don't repeat the category string on every
+// line. The category names used here are exact spendingCategories/SYSTEM_CATEGORIES strings (see
+// DEFAULT_SPENDING_CATEGORIES/SYSTEM_CATEGORIES above) - "Utilities" and "Hardware" are new in v6.9
+// (see ensureMasterSeedCategories) since neither had a real home in the pre-v6.9 category set.
+function seedRules(category, keys) {
+  return keys.map(key => [key, category]);
+}
+
+const DEFAULT_LOOKUP = [
+  ...seedRules("Groceries", [
+    "walmart", "walmart supercenter", "costco", "costco wholesale", "loblaws", "loblaw", "no frills",
+    "real canadian superstore", "superstore", "atlantic superstore", "sobeys", "safeway", "metro",
+    "metro plus", "food basics", "freshco", "longo's", "whole foods", "whole foods market",
+    "trader joe's", "kroger", "publix", "albertsons", "vons", "ralphs", "wegmans", "giant eagle",
+    "meijer", "h-e-b", "aldi", "save-on-foods", "iga", "provigo", "maxi", "zehrs",
+    "your independent grocer", "fortinos", "farm boy", "t&t supermarket", "sprouts farmers market",
+    "winco foods", "stop & shop", "shoprite", "hy-vee", "piggly wiggly", "harris teeter", "food lion",
+    "winn-dixie", "market basket", "bj's wholesale", "sam's club", "thrifty foods", "buy-low foods",
+    "choices market", "nations fresh foods", "adonis", "patel brothers", "foodland", "quality foods",
+    "western family foods", "calgary co-op", "red apple grocery", "real canadian wholesale club",
+    "giant food", "redner's", "weis markets", "price chopper", "festival foods", "lunds & byerlys",
+    "king soopers", "fred meyer", "smith's food and drug", "qfc", "fry's food", "gristedes", "foodtown",
+    "save mart", "vons pavilions", "jewel-osco", "star market", "acme markets", "tops friendly markets",
+    "wegmans food markets", "brookshire's", "schnucks", "hannaford", "ingles markets", "county market",
+    "sav-a-lot", "food city", "brookshire brothers", "lowes foods", "bi-lo", "marsh supermarkets",
+    "dierbergs markets", "homeland stores", "buehler's fresh foods", "cub foods", "hen house market",
+    "price rite marketplace", "market street", "tom thumb", "randalls", "carrs safeway",
+    "haggen food and pharmacy", "lucky supermarkets", "grocery outlet", "food4less", "superior grocers",
+    "northgate gonzalez markets", "cardenas markets",
+  ]),
+  ...seedRules("Dining", [
+    "mcdonald's", "tim hortons", "starbucks", "subway", "wendy's", "burger king", "kfc", "taco bell",
+    "pizza pizza", "domino's", "pizza hut", "panera bread", "chipotle", "a&w", "harvey's",
+    "swiss chalet", "boston pizza", "east side mario's", "milestones grill", "cactus club cafe",
+    "earls kitchen", "white spot", "denny's", "ihop", "applebee's", "chili's", "olive garden",
+    "red lobster", "outback steakhouse", "five guys", "in-n-out burger", "shake shack", "popeyes",
+    "dairy queen", "sonic drive-in", "jimmy john's", "panda express", "chick-fil-a", "wingstop",
+    "buffalo wild wings", "freshii", "second cup", "booster juice", "jugo juice", "montana's bbq",
+    "kelseys", "st-hubert", "uber eats", "doordash", "skipthedishes", "grubhub", "just eat",
+    "papa john's", "little caesars", "jersey mike's", "firehouse subs", "culver's", "whataburger",
+    "carl's jr", "hardee's", "arby's", "checkers drive-in", "rally's", "del taco", "el pollo loco",
+    "qdoba", "moe's southwest grill", "noodles & company", "pei wei", "cava", "sweetgreen", "chopt",
+    "boston market", "cracker barrel", "waffle house", "bob evans", "perkins restaurant",
+    "village inn", "first watch", "black bear diner", "coffee time", "country style",
+    "robin's donuts", "williams fresh cafe", "jamba juice", "tropical smoothie cafe", "smoothie king",
+    "orange julius", "baskin robbins", "cold stone creamery", "menchie's", "yogen fruz",
+    "marble slab creamery", "ben & jerry's", "haagen-dazs", "dunkin", "krispy kreme", "cinnabon",
+    "auntie anne's", "wetzel's pretzels", "mrs fields", "mr sub", "quiznos", "extreme pita",
+    "pita pit", "freshslice pizza", "pizza nova", "gino's pizza", "panago pizza", "mamma's pizza",
+    "greco pizza", "sammy's pizza", "red robin", "tgi fridays", "ruby tuesday", "bonefish grill",
+    "carrabba's", "longhorn steakhouse", "texas roadhouse", "logan's roadhouse", "golden corral",
+    "sizzler", "the keg steakhouse", "moxies grill", "joey restaurant", "jack astor's",
+    "original joe's", "browns socialhouse", "tap & barrel", "pizza 73", "pizza hotline",
+    "boston market canada", "wienerschnitzel", "castle hamburgers", "white castle", "steak n shake",
+    "bojangles", "church's chicken", "zaxby's", "raising cane's", "jack in the box",
+    "del frisco's grill", "cheesecake factory", "p.f. chang's", "yard house", "bj's restaurant",
+    "dave & buster's", "kernels popcorn", "treats bakery", "presse cafe", "pumpernickel's",
+    "cobbs bread", "great canadian bagel", "bagel world", "manchu wok", "edo japan",
+    "teriyaki experience", "thai express", "new york fries",
+  ]),
+  ...seedRules("Transport", [
+    "uber", "lyft", "go transit", "ttc", "oc transpo", "presto card", "metrolinx", "via rail",
+    "amtrak", "greyhound", "megabus", "flixbus", "petro-canada", "shell", "esso", "chevron",
+    "exxonmobil", "husky gas", "circle k", "impark", "green p parking", "indigo parking", "407 etr",
+    "ez-pass", "air canada", "westjet", "porter airlines", "delta air lines", "united airlines",
+    "american airlines", "southwest airlines", "alaska airlines", "jetblue", "spirit airlines",
+    "frontier airlines", "communauto", "car2go", "zipcar", "evo car share", "modo car co-op",
+    "hertz", "enterprise rent-a-car", "avis", "budget rent a car", "national car rental",
+    "thrifty car rental", "bixi montreal", "mobi bike share", "citi bike", "translink", "bc transit",
+    "stm montreal", "calgary transit", "edmonton transit", "winnipeg transit", "halifax transit",
+    "skytrain", "west coast express", "sun country airlines", "allegiant air", "flair airlines",
+    "sunwing airlines", "air transat", "mobil gas", "sunoco", "valero energy", "marathon petroleum",
+    "76 gas station", "arco", "love's travel stop", "pilot flying j", "wawa fuel",
+    "casey's general store", "speedway gas", "kwik trip", "parking panda", "spothero", "laz parking",
+    "flair air", "wheeltrans", "muni san francisco", "bart bay area", "septa philadelphia",
+    "mta new york", "cta chicago", "wmata washington", "marta atlanta", "sound transit seattle",
+    "king county metro", "denver rtd", "dart dallas",
+  ]),
+  ...seedRules("Subscriptions", [
+    "netflix", "spotify", "disney plus", "amazon prime", "apple.com/bill", "icloud storage",
+    "google play", "google storage", "google one", "youtube premium", "youtube tv", "crave tv",
+    "hulu", "hbo max", "paramount plus", "peacock tv", "audible", "xbox game pass", "xbox live",
+    "playstation network", "nintendo eshop", "adobe creative cloud", "microsoft 365", "office 365",
+    "dropbox plus", "patreon", "twitch", "amazon music", "tidal music", "deezer", "siriusxm",
+    "new york times subscription", "globe and mail subscription", "wall street journal",
+    "washington post subscription", "kindle unlimited", "scribd", "calm.com", "headspace",
+    "duolingo plus", "notion labs", "canva", "linkedin premium", "skillshare", "masterclass",
+    "blue apron", "hellofresh", "goodfood", "chefs plate", "fabletics membership", "stitch fix",
+    "birchbox", "ipsy", "barkbox", "chewy autoship", "classpass", "peloton membership", "zwift",
+    "strava subscription", "nordvpn", "expressvpn", "1password", "lastpass", "dashlane", "github",
+    "gitlab", "atlassian", "slack", "zoom.us", "evernote", "todoist", "grammarly", "squarespace",
+    "wix.com", "godaddy", "namecheap", "cloudflare", "mailchimp", "quickbooks online", "turbotax",
+    "norton antivirus", "mcafee", "malwarebytes", "crunchyroll", "funimation", "vudu",
+    "apple tv plus", "discovery plus", "britbox", "acorn tv", "shudder", "mubi", "curiositystream",
+    "babbel", "rosetta stone", "coursera plus", "udemy", "masterclass annual", "wondery plus",
+    "sirius satellite radio", "xm radio canada", "cbc gem", "tou.tv",
+  ]),
+  ...seedRules("Telecom", [
+    "rogers communications", "rogers wireless", "bell canada", "bell mobility", "telus mobility",
+    "freedom mobile", "fido solutions", "koodo mobile", "virgin plus", "public mobile",
+    "chatr mobile", "videotron", "shaw communications", "cogeco", "eastlink", "at&t mobility",
+    "verizon wireless", "t-mobile", "sprint corporation", "xfinity", "comcast", "spectrum",
+    "charter communications", "centurylink", "frontier communications", "cricket wireless",
+    "boost mobile", "metro by t-mobile", "straight talk wireless", "google fi", "mint mobile",
+    "us cellular", "consumer cellular", "ting mobile", "red pocket mobile", "lucky mobile",
+    "sasktel", "mts mobility", "bell aliant", "execulink telecom", "distributel", "teksavvy",
+    "oxio internet", "novus entertainment", "bell fibe", "rogers ignite", "telus optik",
+    "shaw direct", "wightman telecom", "cogeco connexion", "primus telecom", "ebox internet",
+    "vmedia",
+  ]),
+  ...seedRules("Utilities", [
+    "hydro one", "toronto hydro", "bc hydro", "hydro-quebec", "manitoba hydro", "nova scotia power",
+    "newfoundland power", "saskpower", "direct energy", "enbridge gas", "enmax", "epcor",
+    "fortisbc", "fortisalberta", "atco gas", "atco electric", "just energy", "national grid",
+    "con edison", "pg&e", "duke energy", "georgia power", "dominion energy",
+    "southern california edison", "xcel energy", "dte energy", "consumers energy",
+    "national fuel gas", "peoples gas", "nicor gas", "ameren", "entergy", "pseg", "columbia gas",
+    "spire energy", "we energies", "avista utilities", "puget sound energy",
+    "portland general electric", "salt river project", "evergy", "oncor electric",
+    "centerpoint energy", "austin energy", "san diego gas and electric", "city of calgary utilities",
+    "city of edmonton utilities", "hamilton water", "ottawa hydro", "london hydro",
+    "kitchener utilities", "waterloo north hydro", "veridian connections", "alectra utilities",
+    "elexicon energy",
+  ]),
+  ...seedRules("Hardware", [
+    "home depot", "lowe's", "rona", "canadian tire", "home hardware", "ace hardware", "menards",
+    "tractor supply co", "princess auto", "kent building supplies", "timber mart",
+    "castle building centres", "do it best hardware", "true value hardware",
+    "orchard supply hardware", "harbor freight tools", "northern tool", "sherwin-williams",
+    "benjamin moore paints", "ppg paints", "dulux paints", "ikea", "bed bath & beyond",
+    "container store", "restoration hardware", "williams-sonoma", "crate and barrel", "reno-depot",
+    "richelieu hardware", "brico depot", "lee valley tools", "patio drummond", "rona+",
+    "revy home centre", "aikenhead's hardware", "beaver lumber",
+  ]),
+  ...seedRules("Apparel & Gear", [
+    "old navy", "gap outlet", "gap factory", "h&m", "zara", "uniqlo", "lululemon athletica",
+    "nike store", "adidas store", "under armour", "sport chek", "winners", "marshalls", "tj maxx",
+    "ross dress for less", "reitmans", "aritzia", "american eagle outfitters", "hollister co",
+    "abercrombie & fitch", "forever 21", "urban outfitters", "foot locker", "sporting life",
+    "mountain equipment co-op", "columbia sportswear", "the north face", "roots canada",
+    "banana republic", "j.crew", "express clothing", "ann taylor", "loft", "chico's", "talbots",
+    "eddie bauer", "lands' end", "brooks brothers", "nordstrom rack", "saks fifth avenue",
+    "holt renfrew", "hudson's bay", "la maison simons", "browns shoes", "aldo shoes",
+    "dsw shoe warehouse", "journeys shoes", "vans store", "converse store", "skechers",
+    "new balance", "puma store", "reebok store", "champion store", "gymshark",
+    "victoria's secret", "bath & body works", "sephora", "ulta beauty", "zumiez", "pacsun",
+    "tilly's", "hot topic", "spencer's", "claire's", "guess inc", "calvin klein",
+    "tommy hilfiger", "levi's", "dockers", "kohl's", "jcpenney", "macy's", "dillard's", "belk",
+    "burlington coat factory", "primark", "garage clothing", "dynamite clothing", "urban planet",
+    "mark's work wearhouse", "kit and ace", "frank and oak", "sirens fashion", "urban behavior",
+    "bluenotes", "suzy shier", "cleo clothing", "penningtons", "addition elle", "laura canada",
+    "tristan clothing", "moores clothing", "harry rosen", "jack & jones", "moose knuckles",
+    "canada goose", "arc'teryx", "mountain warehouse", "patagonia store", "helly hansen",
+    "sail outdoors", "atmosphere sports",
+  ]),
+  ...seedRules("INCOME: Benefits", [
+    "canada revenue agency", "canada child benefit", "gst hst credit",
+    "employment and social development canada", "service canada", "employment insurance benefit",
+    "canada pension plan", "old age security", "veterans affairs canada", "irs tax refund",
+    "social security administration", "unemployment insurance payment", "snap benefits",
+    "ontario works", "ontario disability support program", "workers compensation board",
+    "wsib payment", "disability tax credit", "canada workers benefit", "canada dental benefit",
+    "alberta child benefit", "bc affordability credit", "manitoba child benefit",
+    "saskatchewan employment supplement", "nova scotia child benefit", "quebec family allowance",
+    "yukon child benefit",
+  ]),
+  ...seedRules("INCOME: Employment", [
+    "adp payroll", "ceridian payroll", "dayforce", "workday inc", "payworks", "wagepoint",
+    "humi payroll", "rippling payroll", "gusto payroll", "quickbooks payroll", "paychex",
+    "ultipro", "sap successfactors", "government of canada pay", "receiver general payroll",
+    "direct deposit payroll", "payroll deposit", "salary deposit", "employer payroll deposit",
+    "replicon payroll", "avanti software payroll", "nethris payroll", "employer direct deposit",
+  ]),
+  ...seedRules("TRANSFER: Internal/Other", [
+    "interac e-transfer", "e-transfer", "email money transfer", "eft transfer", "wire transfer",
+    "td canada trust transfer", "rbc royal bank transfer", "scotiabank transfer",
+    "bmo bank of montreal transfer", "cibc transfer", "national bank of canada transfer",
+    "tangerine transfer", "simplii financial transfer", "desjardins transfer",
+    "hsbc bank canada transfer", "laurentian bank transfer", "paypal transfer", "venmo",
+    "zelle payment", "wise transfer", "western union", "moneygram", "remitly",
+    "xoom money transfer", "chase bank transfer", "bank of america transfer",
+    "wells fargo transfer", "citibank transfer", "us bank transfer", "pnc bank transfer",
+    "capital one transfer", "ally bank transfer", "discover bank transfer",
+    "online banking payment", "bill payment transfer", "stripe payout", "square payout",
+    "cash app transfer", "apple cash transfer", "google pay transfer",
+    "brim financial payment", "neo financial transfer", "koho transfer",
+    "wealthsimple cash transfer", "revolut transfer", "monzo transfer", "n26 transfer",
+    "chime transfer", "varo bank transfer", "current bank transfer", "sofi money transfer",
+    "robinhood transfer", "questrade transfer", "wealthsimple transfer",
+  ]),
+  ...seedRules("TRANSFER: Credit Card Payment", [
+    "credit card payment thank you", "visa payment received", "mastercard payment received",
+    "amex payment received", "american express payment", "credit card autopay",
+    "online credit card payment", "scotiabank credit card payment", "td credit card payment",
+    "rbc credit card payment",
+  ]),
+];
+
+// Precompiles DEFAULT_LOOKUP once at module load, rather than re-parsing/re-sorting it on every single
+// categorize() call: sortLookup() applies the same longest-key-first precedence rule user rules already
+// get (so e.g. "the keg steakhouse" is checked before a hypothetical shorter overlapping key), a
+// regex-shaped key is compiled once via parseRegexRule (an entry that doesn't compile is dropped here,
+// never carried forward as dead weight - same "invalid regex = never matches" rule categorize() already
+// applies to user rules), and a plain key is pre-normalized with normalize() so the runtime check against
+// an already-normalized merchant string is a plain, cheap substring test.
+function compileDefaultLookup(entries) {
+  const compiled = [];
+  for (const [key, cat] of sortLookup(entries)) {
+    if (isRegexRuleKey(key)) {
+      const regex = parseRegexRule(key);
+      if (regex) compiled.push({ regex, cat });
+      continue;
+    }
+    compiled.push({ text: normalize(key), cat });
+  }
+  return compiled;
+}
+const DEFAULT_LOOKUP_COMPILED = compileDefaultLookup(DEFAULT_LOOKUP);
+
 // lookup is an array of [key, category] pairs, longest-key-first (see sortLookup). A transaction
 // matches the FIRST key it hits, so more specific plain keys (e.g. "amazon.ca prime") must be listed
 // before broader ones (e.g. "amazon.ca") or the broad key wins by accident.
@@ -323,6 +571,14 @@ function parseRegexRule(key) {
 // regex normally would. An invalid regex-shaped key just never matches (parseRegexRule already caught
 // the construction error) and categorization moves on to the next rule, rather than falling back to a
 // literal substring search for something like "/uber(/i" that could never usefully match anyway.
+//
+// Tier 2 fallback (v6.9): if no rule in the person's own lookupEntries matches, categorize() falls
+// through to DEFAULT_LOOKUP_COMPILED - the built-in Master Seed Auto-Categorization Dataset above -
+// using the identical regex-vs-plain matching rules (regex against raw, plain against normalized text).
+// A user rule always wins outright: this loop only ever runs after the lookupEntries loop has already
+// exhausted every entry with no match, so nothing here can ever override or race a person's own rule,
+// however that rule was authored (a specific override the dataset also happens to contain a broader
+// entry for still resolves correctly, since Tier 1 exits first).
 function categorize(merchant, lookupEntries) {
   const raw = String(merchant || "");
   const text = normalize(merchant);
@@ -333,6 +589,13 @@ function categorize(merchant, lookupEntries) {
       continue;
     }
     if (text.includes(key)) return { category: cat, norm: key, matched: true };
+  }
+  for (const entry of DEFAULT_LOOKUP_COMPILED) {
+    if (entry.regex) {
+      if (entry.regex.test(raw)) return { category: entry.cat, norm: raw, matched: true };
+    } else if (text.includes(entry.text)) {
+      return { category: entry.cat, norm: entry.text, matched: true };
+    }
   }
   return { category: null, norm: text, matched: false };
 }
@@ -1889,7 +2152,7 @@ export default function Ledger() {
       }
       if (hasL) setLookup(sortLookup(migrateWealthsimpleLookup(payload.lookup)));
       if (hasB) setBudget(prev => ({ ...prev, ...migrateBudget(payload.budget) }));
-      if (hasC) setSpendingCategories(ensureWealthsimpleCategory(payload.spendingCategories));
+      if (hasC) setSpendingCategories(ensureMasterSeedCategories(ensureWealthsimpleCategory(payload.spendingCategories)));
       if (hasRC) setRecurringConfig(payload.recurringConfig);
       if (hasDL) setDashboardLayout(normalizeDashboardLayout(payload.dashboardLayout));
       setHasUnsavedChanges(false);
@@ -2385,7 +2648,7 @@ export default function Ledger() {
       }
       if (hasL) setLookup(sortLookup(migrateWealthsimpleLookup(payload.lookup)));
       if (hasB) setBudget(prev => ({ ...prev, ...migrateBudget(payload.budget) }));
-      if (hasC) setSpendingCategories(ensureWealthsimpleCategory(payload.spendingCategories));
+      if (hasC) setSpendingCategories(ensureMasterSeedCategories(ensureWealthsimpleCategory(payload.spendingCategories)));
       if (hasRC) setRecurringConfig(payload.recurringConfig);
       if (hasDL) setDashboardLayout(normalizeDashboardLayout(payload.dashboardLayout));
       setHasUnsavedChanges(false);
@@ -3702,7 +3965,7 @@ function SettingsTab({
 
       <div style={card}>
         <div style={{ ...label, marginBottom: "10px" }}>Merchant rules ({lookup.length})</div>
-        <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 12px" }}>Every merchant string the categorizer recognizes. Longer, more specific keys are always checked first automatically - you don't need to manage priority order. A key wrapped in slashes with optional flags (e.g. <code style={{ fontFamily: "var(--font-mono)" }}>/^uber\s*eats/i</code>) is matched as a regular expression instead of plain text.</p>
+        <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 12px" }}>Every merchant string the categorizer recognizes. Longer, more specific keys are always checked first automatically - you don't need to manage priority order. A key wrapped in slashes with optional flags (e.g. <code style={{ fontFamily: "var(--font-mono)" }}>/^uber\s*eats/i</code>) is matched as a regular expression instead of plain text. Your rules always take priority - when nothing here matches, Ledger falls back to a built-in dataset of 800+ common North American merchants (groceries, dining, transit, subscriptions, telecom, utilities, hardware, apparel, benefits, payroll, and bank transfers) before giving up and leaving a transaction uncategorized.</p>
         <RegexRuleTester />
         <input value={ruleSearch} onChange={e => setRuleSearch(e.target.value)} placeholder="Search rules..." style={{ ...input, marginBottom: "10px" }} />
         <div style={{ display: "flex", gap: "8px", marginBottom: "12px", flexWrap: "wrap" }}>

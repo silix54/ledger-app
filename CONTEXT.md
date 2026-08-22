@@ -77,6 +77,18 @@ and the lock protects only this browser's live view of the app, not a JSON backu
 See §3's Ingestion Mode & Manual Entry and App Lock subsections for the full breakdown, including why
 the biometric check is meaningful without a server to verify its signature against.
 
+**Update, v6.9:** A built-in Master Seed Auto-Categorization Dataset — ~825 common North American
+merchant substrings, covering Groceries, Dining, Transport, Subscriptions, Telecom, Utilities, Hardware,
+Apparel & Gear, INCOME: Benefits, INCOME: Employment, and both TRANSFER categories — is now consulted as
+a second tier inside `categorize()`, only once a person's own `lookup` rules have all missed. It changes
+no data shape (`DEFAULT_LOOKUP`/`DEFAULT_LOOKUP_COMPILED` are module-scope constants, never persisted,
+never part of `STORAGE_KEY` or JSON export/import, never shown in Settings > Merchant rules) and adds
+zero network calls — this is a hardcoded, build-time-only dataset, not a lookup service. Two new default
+spending categories, "Utilities" and "Hardware", were added (with a migration ensuring every existing
+browser's saved category list picks them up automatically) since the dataset's Utilities/Hardware
+merchant entries needed somewhere real to land. See §3's Master Seed Auto-Categorization Dataset
+subsection for the full breakdown.
+
 ---
 
 ## 2. Core Architecture & Logic Constraints
@@ -715,6 +727,55 @@ device, no live-browser check of the visibilitychange re-lock behavior, no unit 
 `derivePinHash`/`createPinRecord`/`verifyPinRecord` or the manual entry dedup/validation paths. Same
 "build/lint-checked, not live-verified" caveat every other unverified Phase 4/5 item in §5 carries.
 
+### Master Seed Auto-Categorization Dataset (v6.9+)
+
+`categorize(merchant, lookupEntries)` has always matched a person's own `lookup` rules — Tier 1, plain
+substring or regex (see the Regex Rules subsection above), longest-key-first via `sortLookup`. v6.9 adds
+a Tier 2 fallback: once every Tier-1 rule has been checked and missed, `categorize()` falls through to
+`DEFAULT_LOOKUP_COMPILED` — a precompiled form of `DEFAULT_LOOKUP`, a built-in, hardcoded array of
+~825 `[key, category]` tuples (the exact same shape as a `lookup` entry) covering common North American
+merchants across Groceries, Dining, Transport, Subscriptions, Telecom, Utilities, Hardware, Apparel &
+Gear, `INCOME: Benefits`, `INCOME: Employment`, `TRANSFER: Internal/Other`, and
+`TRANSFER: Credit Card Payment`.
+
+- **Strictly a fallback, never an override.** The Tier-1 loop over `lookupEntries` runs to completion
+  first; Tier 2 is only ever consulted if that loop finds nothing. A person's own rule — however broad
+  or narrow — always wins, with zero precedence logic needed to make that true, since Tier 2 code simply
+  never runs when Tier 1 already returned.
+- **`compileDefaultLookup(entries)`** runs once at module load (not on every `categorize()` call):
+  `sortLookup` applies the same longest-key-first precedence Tier 1 already gets, a regex-shaped key
+  (`isRegexRuleKey`/`parseRegexRule`) is compiled once and dropped if it doesn't parse (identical
+  "invalid regex = never matches" rule as Tier 1), and a plain key is pre-normalized with `normalize()`
+  so the runtime check is a cheap substring test against the already-normalized merchant string. The
+  result, `DEFAULT_LOOKUP_COMPILED`, is what `categorize()` actually iterates for Tier 2.
+- **Never persisted, never editable.** `DEFAULT_LOOKUP`/`DEFAULT_LOOKUP_COMPILED` are module-scope
+  constants — not state, not part of `STORAGE_KEY`, not part of JSON export/import, and not listed or
+  editable in Settings > Merchant rules (that table still shows only the person's own `lookup`). A
+  merchant this dataset gets wrong (or misses) is a one-time "no match" the person corrects exactly like
+  any other suggestion; that correction becomes a real Tier-1 `lookup` rule and permanently wins over the
+  dataset for that merchant from then on — the built-in dataset itself never changes as a result.
+- **Two new default spending categories.** "Utilities" and "Hardware" didn't have a real home in the
+  pre-v6.9 `DEFAULT_SPENDING_CATEGORIES` (the closest existing fit, "Household", would have been a
+  misleading catch-all for e.g. hydro bills or a Home Depot run). `ensureMasterSeedCategories` — the
+  same "small, additive, idempotent, safe on every load" pattern as `ensureWealthsimpleCategory` — adds
+  both to any browser's saved `spendingCategories` that predates v6.9, so the dataset's suggestions land
+  on categories that actually exist in Settings and the category filters. It's wired into every path
+  `ensureWealthsimpleCategory` already runs on (`readPersistedStore`, both JSON-import call sites), and
+  is a no-op the moment both categories are already present.
+- **Zero network calls.** This is a hardcoded, build-time dataset shipped in the JS bundle — not a
+  lookup service, not an API call, not something that can go stale without a new build. It adds nothing
+  to §1's no-backend rule or the "zero network calls in normal operation" statement Cloud Sync is still
+  the sole exception to.
+- Settings > Merchant rules' description text now mentions the fallback explicitly, so a person seeing a
+  transaction already correctly categorized with no rule of their own in the table isn't confused about
+  where that suggestion came from.
+
+Checked by `npm run build` + `npm run lint` only so far (both clean, zero new errors against the pre-v6.9
+baseline — see §5) — not yet exercised live: no real bank-statement CSV run through the dataset to spot-
+check false positives/negatives at scale, no unit tests for `categorize()`'s Tier 2 path or
+`compileDefaultLookup`. Same "build/lint-checked, not live-verified" caveat every other unverified item
+in §5 carries.
+
 ---
 
 ## 4. Version Archive Index
@@ -996,12 +1057,37 @@ pick which file to restore from if a rollback is ever needed.
     validation paths. Same "build/lint-checked, not live-verified" caveat every other unverified Phase
     4/5 item here carries.
 
+- **v6.9 — Master Seed Auto-Categorization Dataset.**
+  - **`DEFAULT_LOOKUP` / `DEFAULT_LOOKUP_COMPILED`**: a built-in, hardcoded ~825-entry `[key, category]`
+    dataset covering common North American merchants across Groceries, Dining, Transport, Subscriptions,
+    Telecom, Utilities, Hardware, Apparel & Gear, `INCOME: Benefits`, `INCOME: Employment`, and both
+    `TRANSFER` categories, compiled once at module load (`compileDefaultLookup`) into regex/plain-text
+    matchers using the same rules Tier 1 already uses.
+  - **`categorize()` gains a Tier 2**: once every rule in the person's own `lookup` (Tier 1) has been
+    checked and missed, `categorize()` now falls through to `DEFAULT_LOOKUP_COMPILED` before giving up.
+    A user rule always wins outright — Tier 2 only ever runs after Tier 1 has already exhausted every
+    entry with no match.
+  - **Two new default spending categories**: `"Utilities"` and `"Hardware"`, added to
+    `DEFAULT_SPENDING_CATEGORIES` and backfilled onto any existing browser's saved category list via
+    `ensureMasterSeedCategories` (same additive, idempotent pattern as `ensureWealthsimpleCategory`).
+  - **Settings > Merchant rules** description text now explains the fallback, so a transaction that's
+    already correctly categorized with no rule of the person's own in the table isn't confusing.
+  - **Zero new persisted `STORAGE_KEY` fields, zero network calls**: the dataset is a module-scope
+    constant shipped in the JS bundle — never part of `STORAGE_KEY`/JSON export/import, never shown or
+    editable in Settings, and not a lookup service of any kind.
+  - **Verified by `npm run build` + `npm run lint` only so far**: both clean, `npm run lint` reporting
+    exactly the same 9 pre-existing errors as the Phase 4 baseline (§5) — zero new lint errors or
+    warnings introduced. Not yet exercised live: no real bank-statement CSV run through the dataset to
+    spot-check false positives/negatives at scale, no unit tests for `categorize()`'s Tier 2 path or
+    `compileDefaultLookup`. Same "build/lint-checked, not live-verified" caveat every other unverified
+    item here carries.
+
 ---
 
 ## 5. Current State
 
 The current master component is **`src/Ledger.jsx`** — version comment
-`// Version: 6.8 - Phase 5 Item 2 (Manual Ingestion Form & App Lock)`,
+`// Version: 6.9 - Master Seed Auto-Categorization Dataset`,
 component export `export default function Ledger()`, rendered from `src/App.jsx`. The prior v6.1
 snapshot ("Final Phase 3," all Phase 3 roadmap items complete and verified — unit tests for every
 migration/validation function, a full regression suite across prior versions' features, and a
@@ -1010,28 +1096,31 @@ live-browser Playwright smoke test with screenshots) is kept at `_archive/Ledger
 Phase 4 (Items 1-4, spanning v6.2-v6.6: Transaction Splitting, Advanced Regex Rules Engine,
 Predictive Forecasting & Runway Analytics, Serverless Cloud Sync, Dual-Provider Cloud Sync) is
 complete. Phase 5 Items 1-2 (v6.7 PWA & Offline Caching, v6.8 Manual Ingestion Form & App Lock) are
-now also implemented — see §3's respective subsections and §4's v6.7/v6.8 entries for the full
-breakdown. Across all of these, **only Cloud Sync's Google Drive path** has been manually
-live-verified end-to-end (connect, Sync Now, Pull from Cloud, against a real Google Cloud OAuth client
-and Drive account — see v6.5's entry in §4). Everything else — Transaction Splitting, the Regex Rules
-Engine, Runway Analytics, Dropbox's transport, the PWA/offline layer, and now the manual ingestion form
-and App Lock — is checked with `npm run build` and `npm run lint` only, with no unit tests written yet
-(for `splitTransaction`/`mergeSplitGroup`; `parseRegexRule`/`categorize`'s regex branch;
-`estimateMilestone`; the encrypt/decrypt + Drive/Dropbox REST helpers; the PKCE helpers; v6.8's
-`derivePinHash`/`createPinRecord`/`verifyPinRecord` or its manual-entry dedup/validation paths) and no
-full live-browser regression pass across the whole app. v6.7 has not been exercised as an installed PWA
-in a real mobile browser (Add to Home Screen, an actual airplane-mode reload, a Lighthouse PWA audit,
-or manual touch-target testing on a real device); v6.8 has not been exercised against a real WebAuthn
-platform authenticator on an actual device, nor has its `visibilitychange` re-lock behavior or the
-manual form's live categorization been checked in a running browser — see §3 and §4's respective
-entries for exactly what was and wasn't checked.
+also implemented, and v6.9 (Master Seed Auto-Categorization Dataset) has since landed on top of that —
+see §3's respective subsections and §4's v6.7/v6.8 entries for the full breakdown. Across all of these,
+**only Cloud Sync's Google Drive path** has been manually live-verified end-to-end (connect, Sync Now,
+Pull from Cloud, against a real Google Cloud OAuth client and Drive account — see v6.5's entry in §4).
+Everything else — Transaction Splitting, the Regex Rules Engine, Runway Analytics, Dropbox's transport,
+the PWA/offline layer, the manual ingestion form and App Lock, and now the v6.9 dataset — is checked with
+`npm run build` and `npm run lint` only, with no unit tests written yet (for
+`splitTransaction`/`mergeSplitGroup`; `parseRegexRule`/`categorize`'s regex branch; `estimateMilestone`;
+the encrypt/decrypt + Drive/Dropbox REST helpers; the PKCE helpers; v6.8's
+`derivePinHash`/`createPinRecord`/`verifyPinRecord` or its manual-entry dedup/validation paths; v6.9's
+`categorize()` Tier 2 path or `compileDefaultLookup`) and no full live-browser regression pass across the
+whole app. v6.7 has not been exercised as an installed PWA in a real mobile browser (Add to Home Screen,
+an actual airplane-mode reload, a Lighthouse PWA audit, or manual touch-target testing on a real device);
+v6.8 has not been exercised against a real WebAuthn platform authenticator on an actual device, nor has
+its `visibilitychange` re-lock behavior or the manual form's live categorization been checked in a
+running browser; v6.9's ~825-entry dataset has not been run against a real bank-statement CSV to spot-
+check false positives/negatives at scale — see §3 and §4's respective entries for exactly what was and
+wasn't checked.
 
 **Pre-existing `npm run lint` errors, unrelated to Phase 4/5:** `npm run lint` on the codebase as
 received at the start of Phase 4 Item 4 already reported 9 errors having nothing to do with cloud
 sync — an unused `Settings` icon import, two `no-useless-assignment` warnings inside `migrateBudget`,
 two unused `err` catch-clause bindings (theme init, autosave), and four React Compiler
 `react-hooks` findings (`set-state-in-effect` ×3, `immutability` ×1) in pre-existing effects/memos.
-v6.5 through v6.8 were each written to introduce **zero new** lint errors or warnings on top of
+v6.5 through v6.9 were each written to introduce **zero new** lint errors or warnings on top of
 that baseline (verified by diffing `npm run lint` before/after each) rather than silently accumulating
 more debt, but none of those 9 pre-existing ones were touched or fixed here since they're out of
 scope for these features — flagging them explicitly so a future pass doesn't mistake "9 errors" for
