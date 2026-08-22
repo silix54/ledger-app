@@ -1,9 +1,9 @@
-// Version: 6.9.3 - CSV import: prioritize primary Description/Merchant/Payee columns over
-// secondary Sub-Description/Location/Memo columns when auto-detecting the merchant field
+// Version: 6.9.4 - Resilient CSV import: flexible date/amount parsing (multi-format dates,
+// currency-symbol/parentheses amounts, Debit/Credit columns) + a Skipped Rows review & recovery drawer
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
 import { BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
-import { Upload, Download, Plus, AlertCircle, Check, Copy, ChevronDown, Trash2, Settings, FolderOpen, Sun, Moon, X, Pencil, Undo2, Printer, ArrowUp, ArrowDown, LayoutGrid, Split, Merge, Cloud, UploadCloud, DownloadCloud, LogOut, Loader2, Lock, Fingerprint, Delete, KeyRound } from "lucide-react";
+import { Upload, Download, Plus, AlertCircle, Check, Copy, ChevronDown, ChevronUp, Trash2, Settings, FolderOpen, Sun, Moon, X, Pencil, Undo2, Printer, ArrowUp, ArrowDown, LayoutGrid, Split, Merge, Cloud, UploadCloud, DownloadCloud, LogOut, Loader2, Lock, Fingerprint, Delete, KeyRound } from "lucide-react";
 
 // System categories drive core calculations (savings tracking, income totals, transfer exclusion) -
 // not user-editable, since removing or renaming one would silently break the math elsewhere.
@@ -303,6 +303,108 @@ function dedupeAgainstCommitted(rows, committed) {
 const MAX_IMPORT_BYTES = 25 * 1024 * 1024;
 const MAX_IMPORT_ROWS = 200000;
 const MAX_PASTE_LINES = 5000;
+
+// --- Flexible CSV/paste date & amount parsing ------------------------------------------------
+// Bank statements spell dates and amounts in a lot of different ways; these normalize whatever
+// comes in to what the rest of the app actually understands (a YYYY-MM-DD string for date, a plain
+// signed number for amount) so fewer real rows land in the "couldn't be parsed" pile.
+
+const MONTH_NAMES = {
+  jan: 1, january: 1, feb: 2, february: 2, mar: 3, march: 3, apr: 4, april: 4, may: 5,
+  jun: 6, june: 6, jul: 7, july: 7, aug: 8, august: 8, sep: 9, sept: 9, september: 9,
+  oct: 10, october: 10, nov: 11, november: 11, dec: 12, december: 12,
+};
+
+function pad2(n) { return String(n).padStart(2, "0"); }
+
+// Builds a YYYY-MM-DD string and only returns it if it survives a round-trip through Date - guards
+// against e.g. year/month/day (2026, 2, 30) silently becoming March 2nd instead of being rejected.
+// Interpreted as UTC (per the ISO 8601 date-only spec new Date() follows), so getUTC* is used for
+// the round-trip check rather than the local getters, which would drift a day near a timezone edge.
+function toISODate(year, month, day) {
+  if (!(year >= 1000 && year <= 9999) || !(month >= 1 && month <= 12) || !(day >= 1 && day <= 31)) return null;
+  const iso = `${year}-${pad2(month)}-${pad2(day)}`;
+  const d = new Date(iso);
+  if (isNaN(d.getTime()) || d.getUTCFullYear() !== year || d.getUTCMonth() + 1 !== month || d.getUTCDate() !== day) return null;
+  return iso;
+}
+
+// Accepts the date spellings a bank statement is likely to use - ISO (YYYY-MM-DD), numeric D/M/Y or
+// M/D/Y with '/' or '-' separators (2 or 4-digit year), and a text month either side of the day
+// ("22-AUG-2026", "Aug 22, 2026") - and normalizes to this app's canonical YYYY-MM-DD, or returns
+// null if nothing recognizable was found. Numeric day/month order is genuinely ambiguous when both
+// parts are <=12 (e.g. "05/06/2026"): this app is Canadian-first (see the built-in CIBC/BMO/Canadian-
+// merchant dataset elsewhere in this file), so an ambiguous numeric date defaults to day-first
+// (Canadian/UK convention) rather than month-first (US) - an unambiguous case (either part >12) is
+// read correctly regardless of which convention the file actually uses.
+function parseFlexibleDate(raw) {
+  const s = String(raw ?? "").trim();
+  if (!s) return null;
+
+  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m) return toISODate(+m[1], +m[2], +m[3]);
+
+  m = s.match(/^(\d{1,2})[\s\-/]+([A-Za-z]{3,9})[\s\-/,]+(\d{4})$/); // "22-AUG-2026", "22 Aug, 2026"
+  if (m && MONTH_NAMES[m[2].toLowerCase()]) return toISODate(+m[3], MONTH_NAMES[m[2].toLowerCase()], +m[1]);
+
+  m = s.match(/^([A-Za-z]{3,9})[\s\-/]+(\d{1,2}),?[\s\-/]+(\d{4})$/); // "Aug 22 2026", "August 22, 2026"
+  if (m && MONTH_NAMES[m[1].toLowerCase()]) return toISODate(+m[3], MONTH_NAMES[m[1].toLowerCase()], +m[2]);
+
+  m = s.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2}|\d{4})$/); // numeric D/M/Y or M/D/Y, either separator
+  if (m) {
+    const a = +m[1], b = +m[2];
+    let y = +m[3];
+    if (y < 100) y += y < 70 ? 2000 : 1900; // 2-digit year pivot: 00-69 -> 2000s, 70-99 -> 1900s
+    if (a > 12 && b <= 12) return toISODate(y, b, a); // unambiguous day-first
+    if (b > 12 && a <= 12) return toISODate(y, a, b); // unambiguous month-first
+    if (a <= 12 && b <= 12) return toISODate(y, b, a); // ambiguous - default day-first, see comment above
+    return null; // both >12: not a valid date under either convention
+  }
+
+  return null;
+}
+
+// Cleans common bank-statement amount spellings before parseFloat: currency symbols/codes ($, CAD,
+// USD, CDN), thousands-separator commas, a trailing negative sign some exports use instead of a
+// leading one ("50.00-"), and accounting-style parentheses for negatives ("(50.00)" -> "-50.00").
+// Currency markers are stripped before sign detection so a leading "$-50.00" or "-CAD 50.00" doesn't
+// hide its sign behind the symbol/code. Returns NaN (not 0) for anything that still isn't a number,
+// so a genuinely unparseable amount stays distinguishable from a real zero-dollar transaction.
+function parseFlexibleAmount(raw) {
+  let s = String(raw ?? "").trim();
+  if (!s) return NaN;
+  s = s.replace(/CAD|USD|CDN|\$/gi, "").trim();
+  let negative = false;
+  if (/^\(.*\)$/.test(s)) { negative = true; s = s.slice(1, -1).trim(); }
+  if (s.endsWith("-")) { negative = true; s = s.slice(0, -1).trim(); }
+  if (s.startsWith("-")) { negative = true; s = s.slice(1).trim(); }
+  if (s.startsWith("+")) { s = s.slice(1).trim(); }
+  s = s.replace(/,/g, "");
+  const n = parseFloat(s);
+  if (!Number.isFinite(n)) return NaN;
+  return negative ? -Math.abs(n) : n;
+}
+
+// Header names for a file that splits money-out/money-in across two columns instead of one signed
+// Amount column - "Debit"/"Credit" and "Withdrawal(s)"/"Deposit(s)" are the common spellings.
+const DEBIT_NAMES = ["debit", "withdrawal", "withdrawals"];
+const CREDIT_NAMES = ["credit", "deposit", "deposits"];
+
+// Combines separate Debit/Credit (or Withdrawals/Deposits) column values into this app's single
+// signed Amount (negative = money out, matching every other ingestion path). Each side is read as a
+// plain magnitude via parseFlexibleAmount regardless of whether the source file already put its own
+// sign on debit values, so a file that already writes debits as negative doesn't get double-negated.
+// A blank/unparseable cell on one side contributes 0, not NaN, so a normal single-sided row (only
+// Debit or only Credit populated, the usual case) still combines cleanly. Returns "" - not "0" - when
+// both sides are blank/unparseable, so the row is correctly treated as missing an amount rather than
+// a real $0 transaction.
+function combineDebitCredit(debitRaw, creditRaw) {
+  const debitVal = debitRaw && String(debitRaw).trim() ? parseFlexibleAmount(debitRaw) : NaN;
+  const creditVal = creditRaw && String(creditRaw).trim() ? parseFlexibleAmount(creditRaw) : NaN;
+  if (!Number.isFinite(debitVal) && !Number.isFinite(creditVal)) return "";
+  const amount = (Number.isFinite(creditVal) ? Math.abs(creditVal) : 0) - (Number.isFinite(debitVal) ? Math.abs(debitVal) : 0);
+  return String(amount);
+}
 
 // A lookup key wrapped in slashes with optional trailing flags (e.g. "/^uber\s*eats/i") is a regex
 // rule instead of a plain substring - detected by shape alone, not a stored flag, so the existing
@@ -1246,10 +1348,13 @@ function CategoryBadge({ category }) {
 }
 
 // Shown when a CSV's headers don't obviously map to Date/Description/Merchant/Amount - lets the
-// person point at the actual columns instead of the upload silently failing or guessing wrong.
+// person point at the actual columns instead of the upload silently failing or guessing wrong. The
+// "split Debit/Credit" toggle covers files that spread money-out/money-in across two columns
+// instead of one signed Amount column - see combineDebitCredit for how those two get merged.
 function CSVMappingPanel({ mapping, onConfirm, onCancel }) {
-  const [picks, setPicks] = useState({ date: "", description: "", merchant: "", amount: "" });
-  const ready = picks.date && picks.amount;
+  const [picks, setPicks] = useState({ date: "", description: "", merchant: "", amount: "", debit: "", credit: "" });
+  const [splitAmount, setSplitAmount] = useState(false);
+  const ready = picks.date && (splitAmount ? (picks.debit || picks.credit) : picks.amount);
   return (
     <div style={{ ...card, borderColor: "var(--border-warning)" }}>
       <div style={{ fontSize: "13px", fontWeight: 500, marginBottom: "6px" }}>
@@ -1257,10 +1362,23 @@ function CSVMappingPanel({ mapping, onConfirm, onCancel }) {
         Couldn't auto-detect columns in "{mapping.filename}"
       </div>
       <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 12px" }}>Match each field to a column from this file. Date and Amount are required.</p>
+      <label style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "12px", color: "var(--text-secondary)", marginBottom: "12px", cursor: "pointer" }}>
+        <input type="checkbox" checked={splitAmount} onChange={e => setSplitAmount(e.target.checked)} />
+        This file has separate Debit/Credit (or Withdrawals/Deposits) columns instead of one Amount column
+      </label>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: "10px", marginBottom: "12px" }}>
-        {["date", "description", "merchant", "amount"].map(field => (
+        {["date", "description", "merchant"].map(field => (
           <div key={field}>
-            <div style={label}>{field[0].toUpperCase() + field.slice(1)}{(field === "date" || field === "amount") ? " *" : ""}</div>
+            <div style={label}>{field[0].toUpperCase() + field.slice(1)}{field === "date" ? " *" : ""}</div>
+            <select value={picks[field]} onChange={e => setPicks(p => ({ ...p, [field]: e.target.value }))} style={input}>
+              <option value="">-- choose column --</option>
+              {mapping.headers.map(h => <option key={h} value={h}>{h}</option>)}
+            </select>
+          </div>
+        ))}
+        {(splitAmount ? ["debit", "credit"] : ["amount"]).map(field => (
+          <div key={field}>
+            <div style={label}>{field[0].toUpperCase() + field.slice(1)}{!splitAmount ? " *" : ""}</div>
             <select value={picks[field]} onChange={e => setPicks(p => ({ ...p, [field]: e.target.value }))} style={input}>
               <option value="">-- choose column --</option>
               {mapping.headers.map(h => <option key={h} value={h}>{h}</option>)}
@@ -1270,7 +1388,69 @@ function CSVMappingPanel({ mapping, onConfirm, onCancel }) {
       </div>
       <div style={{ display: "flex", gap: "8px" }}>
         <button style={btn} onClick={onCancel}>Cancel</button>
-        <button style={{ ...btnPrimary, opacity: ready ? 1 : 0.5 }} disabled={!ready} onClick={() => onConfirm(picks)}>Use this mapping</button>
+        <button style={{ ...btnPrimary, opacity: ready ? 1 : 0.5 }} disabled={!ready} onClick={() => onConfirm({ ...picks, splitAmount })}>Use this mapping</button>
+      </div>
+    </div>
+  );
+}
+
+// Shown when one or more CSV/paste rows failed automatic parsing (an unreadable date, a currency-
+// symbol'd amount, a blank merchant) instead of silently discarding them - each gets its own
+// editable Date/Merchant/Category/Amount row so a quick fix can be recovered into staging without
+// retyping the whole line by hand. Edits are kept in local `drafts` state keyed by skipId rather than
+// writing back into the row itself, so the raw original values (shown as placeholders/defaults) stay
+// visible as a reference while editing.
+function SkippedRowsDrawer({ rows, categories, onRecover, onDismissRow, onDismissAll }) {
+  const [drafts, setDrafts] = useState({});
+  const draftOf = r => drafts[r.skipId] || { date: r.raw.date, merchant: r.raw.merchant, amount: r.raw.amount, category: "" };
+  // Reads/writes off `prev` (the updater's own snapshot) rather than the `drafts` closure above, so
+  // this can't lose an edit to a stale read if two field changes land in the same batched update.
+  const setField = (skipId, field, value) => setDrafts(prev => {
+    const raw = rows.find(x => x.skipId === skipId)?.raw || {};
+    const current = prev[skipId] || { date: raw.date, merchant: raw.merchant, amount: raw.amount, category: "" };
+    return { ...prev, [skipId]: { ...current, [field]: value } };
+  });
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+        <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: 0 }}>Fix each row below and click "Add to import" to recover it into the staging list above - or discard rows you don't need.</p>
+        <button style={{ ...btn, padding: "4px 10px" }} onClick={onDismissAll}>Discard all</button>
+      </div>
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead><tr><th style={th}>Why it was skipped</th><th style={th}>Date</th><th style={th}>Merchant</th><th style={th}>Amount</th><th style={th}>Category</th><th style={th}></th></tr></thead>
+          <tbody>
+            {rows.map(r => {
+              const draft = draftOf(r);
+              const parsedDate = parseFlexibleDate(draft.date);
+              const parsedAmount = parseFlexibleAmount(draft.amount);
+              const merchant = draft.merchant.trim();
+              const canRecover = parsedDate && Number.isFinite(parsedAmount) && merchant && draft.category;
+              return (
+                <tr key={r.skipId}>
+                  <td style={{ ...td, fontSize: "11px", color: "var(--text-warning)", maxWidth: "180px" }}>{r.reason}</td>
+                  <td style={td}><input value={draft.date} onChange={e => setField(r.skipId, "date", e.target.value)} style={{ ...input, width: "120px", borderColor: draft.date && !parsedDate ? "var(--border-warning)" : "var(--border)" }} /></td>
+                  <td style={td}><input value={draft.merchant} onChange={e => setField(r.skipId, "merchant", e.target.value)} style={{ ...input, width: "160px", borderColor: draft.merchant && !merchant ? "var(--border-warning)" : "var(--border)" }} /></td>
+                  <td style={td}><input value={draft.amount} onChange={e => setField(r.skipId, "amount", e.target.value)} style={{ ...input, width: "100px", borderColor: draft.amount && !Number.isFinite(parsedAmount) ? "var(--border-warning)" : "var(--border)" }} /></td>
+                  <td style={td}>
+                    <select value={draft.category} onChange={e => setField(r.skipId, "category", e.target.value)} style={{ ...input, width: "170px", borderColor: !draft.category ? "var(--border-warning)" : "var(--border)" }}>
+                      <option value="">Choose a category...</option>
+                      {categories.map(c => <option key={c} value={c}>{c}</option>)}
+                    </select>
+                  </td>
+                  <td style={{ ...td, whiteSpace: "nowrap" }}>
+                    <button style={{ ...btnPrimary, padding: "4px 8px", opacity: canRecover ? 1 : 0.5, marginRight: "6px" }} disabled={!canRecover}
+                      onClick={() => { onRecover(r.skipId, { date: parsedDate, merchant, amount: parsedAmount, category: draft.category }); setDrafts(prev => { const next = { ...prev }; delete next[r.skipId]; return next; }); }}>
+                      Add to import
+                    </button>
+                    <button style={{ ...btn, padding: "4px 8px" }} onClick={() => onDismissRow(r.skipId)}>Discard</button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
       </div>
     </div>
   );
@@ -1783,9 +1963,16 @@ export default function Ledger() {
   const allCategories = useMemo(() => [...spendingCategories, ...SYSTEM_CATEGORIES], [spendingCategories]);
 
   const nextStageId = useRef(0);
+  const nextSkipId = useRef(0);
 
   // Every new statement lands in staging first - nothing reaches the permanent log until confirmed.
   const [staging, setStaging] = useState([]);
+  // Rows a CSV/paste import couldn't parse automatically (bad date, unreadable amount, blank
+  // merchant) - kept around with their raw values and a human-readable reason instead of being
+  // silently dropped, so the Log tab's "review & fix" drawer can offer them back for a quick manual
+  // correction. See stageRows for what lands here and SkippedRowsDrawer for the recovery UI.
+  const [skippedRows, setSkippedRows] = useState([]);
+  const [skippedDrawerOpen, setSkippedDrawerOpen] = useState(false);
   // Tracks the ids committed by the most recent commitStaging batch (or null once undone/dismissed/
   // replaced by a newer import), so the Log tab can offer a one-click "Undo last import" that rolls
   // back exactly that batch - not "delete everything", and not tied to any particular file/paste source.
@@ -2264,30 +2451,62 @@ export default function Ledger() {
   const [importWarning, setImportWarning] = useState("");
 
   function stageRows(rows) {
-    const cleaned = rows.map(r => {
+    const cleaned = [];
+    const failed = [];
+    rows.forEach(r => {
+      const rawDate = (r.date ?? "").toString().trim();
+      const rawAmount = (r.amount ?? "").toString().trim();
       const merchant = (r.merchant || r.description || "").toString().trim();
-      const date = (r.date || "").toString().trim();
-      const amount = parseFloat(r.amount);
-      const { category, matched } = categorize(merchant, lookup);
-      return {
-        stageId: nextStageId.current++, date, description: r.description,
-        merchant, amount, suggested: category, category: category || "", matched,
-      };
+      const date = parseFlexibleDate(rawDate);
+      const amount = parseFlexibleAmount(rawAmount);
+
+      const issues = [];
+      if (!rawDate) issues.push("Missing date");
+      else if (!date) issues.push(`Unparseable date: "${rawDate}"`);
+      if (!rawAmount) issues.push("Missing amount");
+      else if (!Number.isFinite(amount)) issues.push(`Unparseable amount: "${rawAmount}"`);
+      if (!merchant) issues.push("Missing merchant/description");
+
+      if (issues.length === 0) {
+        const { category, matched } = categorize(merchant, lookup);
+        cleaned.push({
+          stageId: nextStageId.current++, date, description: r.description,
+          merchant, amount, suggested: category, category: category || "", matched,
+        });
+      } else {
+        failed.push({ skipId: nextSkipId.current++, reason: issues.join("; "),
+          raw: { date: rawDate, description: (r.description ?? "").toString(), merchant, amount: rawAmount } });
+      }
     });
-    const valid = cleaned.filter(r => isValidDateString(r.date) && Number.isFinite(r.amount) && r.merchant);
-    const skipped = cleaned.length - valid.length;
 
     // Dedup against both what's already committed and what's already sitting in staging, so
     // re-selecting the same folder (or the same file twice) never creates duplicate entries.
-    const { kept, duplicateCount } = dedupeAgainstCommitted(valid, [...transactions, ...staging]);
+    const { kept, duplicateCount } = dedupeAgainstCommitted(cleaned, [...transactions, ...staging]);
 
     const parts = [];
-    if (skipped > 0) parts.push(`${skipped} row${skipped !== 1 ? "s" : ""} skipped - missing or unreadable date/amount`);
+    if (failed.length > 0) parts.push(`${failed.length} row${failed.length !== 1 ? "s" : ""} could not be parsed automatically`);
     if (duplicateCount > 0) parts.push(`${duplicateCount} duplicate row${duplicateCount !== 1 ? "s" : ""} already in your log, skipped`);
     setImportWarning(parts.join(". "));
+    if (failed.length) setSkippedRows(prev => [...prev, ...failed]);
 
     setStaging(prev => [...prev, ...kept]);
   }
+
+  // Called from SkippedRowsDrawer once a skipped row's Date/Merchant/Amount/Category have all been
+  // fixed and are ready to recover into staging. Reuses confirmIfDuplicate rather than the bulk
+  // path's silent skip-and-report, since recovering one row here is a single deliberate action -
+  // same reasoning ManualTransactionForm's single-row entry already follows (see confirmIfDuplicate).
+  function recoverSkippedRow(skipId, fixed) {
+    if (!confirmIfDuplicate({ date: fixed.date, merchant: fixed.merchant, description: fixed.merchant, amount: fixed.amount })) return;
+    const { category: suggested } = categorize(fixed.merchant, lookup);
+    setStaging(prev => [...prev, {
+      stageId: nextStageId.current++, date: fixed.date, description: fixed.merchant,
+      merchant: fixed.merchant, amount: fixed.amount, suggested, category: fixed.category, matched: fixed.category === suggested,
+    }]);
+    setSkippedRows(prev => prev.filter(r => r.skipId !== skipId));
+  }
+  function dismissSkippedRow(skipId) { setSkippedRows(prev => prev.filter(r => r.skipId !== skipId)); }
+  function dismissAllSkippedRows() { setSkippedRows([]); }
 
   // Ordered by how confidently a header names the transaction's actual merchant/description text,
   // most confident first. "Description 1"/"Transaction Description"/"Merchant"/"Payee"/"Main
@@ -2314,7 +2533,11 @@ export default function Ledger() {
     };
     const hasDate = keys.some(k => k.toLowerCase().trim() === "date");
     const hasAmount = keys.some(k => k.toLowerCase().trim() === "amount");
-    if (!hasDate || !hasAmount) {
+    // No single Amount column - fall back to a Debit/Credit (or Withdrawals/Deposits) pair, if the
+    // file has one, before giving up and asking the person to map columns by hand.
+    const hasDebitCredit = !hasAmount && (keys.some(k => DEBIT_NAMES.includes(k.toLowerCase().trim()))
+      || keys.some(k => CREDIT_NAMES.includes(k.toLowerCase().trim())));
+    if (!hasDate || (!hasAmount && !hasDebitCredit)) {
       return { needsMapping: true, headers: keys, rawRows: res.data, filename };
     }
     return {
@@ -2328,7 +2551,8 @@ export default function Ledger() {
         // secondary column is blank.
         const merchant = primaryText && secondaryText && secondaryText !== primaryText
           ? `${primaryText} - ${secondaryText}` : (primaryText || secondaryText);
-        return { date: find(row, ["date"]), description: primaryText, merchant, amount: find(row, ["amount"]) };
+        const amount = hasAmount ? find(row, ["amount"]) : combineDebitCredit(find(row, DEBIT_NAMES), find(row, CREDIT_NAMES));
+        return { date: find(row, ["date"]), description: primaryText, merchant, amount };
       }),
     };
   }
@@ -2404,7 +2628,8 @@ export default function Ledger() {
     if (!pendingMapping) return;
     const rows = pendingMapping.rawRows.map(row => ({
       date: row[mapping.date] || "", description: row[mapping.description] || "",
-      merchant: (row[mapping.merchant] || row[mapping.description] || ""), amount: row[mapping.amount] || "",
+      merchant: (row[mapping.merchant] || row[mapping.description] || ""),
+      amount: mapping.splitAmount ? combineDebitCredit(row[mapping.debit], row[mapping.credit]) : (row[mapping.amount] || ""),
     }));
     stageRows(rows);
     setPendingMapping(null);
@@ -3461,7 +3686,7 @@ export default function Ledger() {
                     <input ref={folderInputRef} type="file" webkitdirectory="" multiple style={{ display: "none" }}
                       onChange={e => { const files = e.target.files; if (files && files.length) handleFolderSelect(files); e.target.value = ""; }} />
                   </label>
-                  <span style={{ fontSize: "12px", color: "var(--text-muted)", alignSelf: "center" }}>Columns: Date, Description, Merchant, Amount (negative = money out). "Select folder" grabs every CSV inside it and skips anything already in your log.</span>
+                  <span style={{ fontSize: "12px", color: "var(--text-muted)", alignSelf: "center" }}>Columns: Date, Description, Merchant, Amount (negative = money out) - or separate Debit/Credit columns. Dates and currency-formatted amounts ($, CAD, parentheses) are read flexibly. "Select folder" grabs every CSV inside it and skips anything already in your log.</span>
                 </div>
                 <div style={{ marginTop: "12px" }}>
                   <textarea value={pasteText} onChange={e => setPasteText(e.target.value)} placeholder={"Or paste rows, one per line: 2026-09-05\\tpos purchase\\tfizz\\t-23.73"} style={{ ...input, minHeight: "70px", fontFamily: "var(--font-mono)", fontSize: "12px" }} />
@@ -3472,6 +3697,25 @@ export default function Ledger() {
           </div>
 
           {pendingMapping && <CSVMappingPanel mapping={pendingMapping} onConfirm={confirmManualMapping} onCancel={() => setPendingMapping(null)} />}
+
+          {skippedRows.length > 0 && (
+            <div style={{ ...card, borderColor: "var(--border-warning)", padding: 0, overflow: "hidden" }}>
+              <button type="button" onClick={() => setSkippedDrawerOpen(o => !o)}
+                style={{ width: "100%", textAlign: "left", background: "var(--bg-warning)", border: "none", cursor: "pointer", padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px" }}>
+                <span style={{ fontSize: "13px", color: "var(--text-warning)" }}>
+                  <AlertCircle size={14} style={{ verticalAlign: "-2px", marginRight: "6px" }} />
+                  ⚠️ {skippedRows.length} row{skippedRows.length !== 1 ? "s" : ""} could not be parsed automatically — click to review & fix
+                </span>
+                {skippedDrawerOpen ? <ChevronUp size={16} color="var(--text-warning)" /> : <ChevronDown size={16} color="var(--text-warning)" />}
+              </button>
+              {skippedDrawerOpen && (
+                <div style={{ padding: "12px 16px" }}>
+                  <SkippedRowsDrawer rows={skippedRows} categories={allCategories}
+                    onRecover={recoverSkippedRow} onDismissRow={dismissSkippedRow} onDismissAll={dismissAllSkippedRows} />
+                </div>
+              )}
+            </div>
+          )}
 
           {staging.length > 0 && (
             <div style={{ ...card, borderColor: stagingUnmatchedCount ? "var(--border-warning)" : "var(--border)" }}>
