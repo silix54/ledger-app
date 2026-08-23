@@ -1,13 +1,8 @@
-// Version: 6.9.12 - Category spending now nets refunds against their original purchase instead of
-// summing magnitudes (a $150 purchase + $150 return nets to $0, not $300) - fixed across
-// txnExpenseAmount, the category ranking + top-merchants drill-down, the monthly cash flow chart's
-// outflow bars, and the fixed-vs-discretionary breakdown. Added a first-class "Investment" category
-// Behavior (Settings), defaulting "Investing"/"Investments" categories to it, which now excludes
-// dedicated investment categories from lifestyle-spend analytics entirely and feeds a new dedicated
-// "Investments & Wealth Accumulation" Dashboard widget (monthly contribution chart + top destinations)
-// below the cash flow chart. The KPI grid is now Total Earned / Total Lifestyle Spend (net) / Total
-// Invested / Net Cash Remaining (earned − spend − invested) / Investment Rate %, replacing the old
-// Net Savings + Avg Daily Spend tiles
+// Version: 6.9.13 - Master Seed Tier 2 dataset: a generic Interac e-Transfer ("E-TRANSFER",
+// "ETRANSFER") no longer auto-files as TRANSFER: Internal/Other, since it doesn't actually say who the
+// money went to or why - it now lands in REVIEW: Ambiguous for a person to look at, unless the
+// e-transfer text itself names an investment platform (Wealthsimple, Questrade, a brokerage), in which
+// case it goes straight to Investing
 import { useState, useMemo, useRef, useEffect } from "react";
 import Papa from "papaparse";
 import { BarChart, Bar, AreaChart, Area, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ResponsiveContainer } from "recharts";
@@ -956,7 +951,7 @@ const DEFAULT_LOOKUP = [
     "replicon payroll", "avanti software payroll", "nethris payroll", "employer direct deposit",
   ]),
   ...seedRules("TRANSFER: Internal/Other", [
-    "interac e-transfer", "e-transfer", "email money transfer", "eft transfer", "wire transfer",
+    "email money transfer", "eft transfer", "wire transfer",
     "td canada trust transfer", "rbc royal bank transfer", "scotiabank transfer",
     "bmo bank of montreal transfer", "cibc transfer", "national bank of canada transfer",
     "tangerine transfer", "simplii financial transfer", "desjardins transfer",
@@ -971,6 +966,27 @@ const DEFAULT_LOOKUP = [
     "wealthsimple cash transfer", "revolut transfer", "monzo transfer", "n26 transfer",
     "chime transfer", "varo bank transfer", "current bank transfer", "sofi money transfer",
     "robinhood transfer", "questrade transfer", "wealthsimple transfer",
+  ]),
+  // A generic Interac e-Transfer ("INTERAC E-TRANSFER", "E-TRANSFER", "ETRANSFER" - the plain
+  // "interac e-transfer"/"e-transfer" keys this replaces, formerly filed straight under TRANSFER:
+  // Internal/Other) doesn't actually say who the money went to or why, unlike every other entry in
+  // that bucket above (a named bank/platform). Auto-filing it as a settled internal transfer silently
+  // hides person-to-person payments, rent splits, and one-off sales that are real income or spend, not
+  // a transfer between one's own accounts - so it's routed to REVIEW: Ambiguous for a person to
+  // actually look at, UNLESS the e-transfer text itself names an investment platform (Wealthsimple,
+  // Questrade, a brokerage), in which case it's unambiguous and goes straight to Investing.
+  // \be[-\s]?transfer\b (not a bare "e-?transfer" substring) matters here: without the leading \b,
+  // this would also match the "...e transfer" tail already embedded inside "wire transfer" (and any
+  // other "<word ending in e> transfer" entry above) once run through normalize()'s hyphen-to-space
+  // rewrite - \b only matches where "e" starts a fresh token, not mid-word. The two rules below are
+  // exact complements of each other (one requires an investment keyword anywhere in the string, the
+  // other requires its absence), so which one sortLookup happens to place first never matters - a given
+  // e-transfer description can only ever satisfy one of the two.
+  ...seedRules("Investing", [
+    "/(?=.*\\be[-\\s]?transfer\\b)(?=.*\\b(?:wealthsimple|questrade|brokerage)\\b)/i",
+  ]),
+  ...seedRules("REVIEW: Ambiguous", [
+    "/(?=.*\\be[-\\s]?transfer\\b)(?!.*\\b(?:wealthsimple|questrade|brokerage)\\b)/i",
   ]),
   ...seedRules("TRANSFER: Credit Card Payment", [
     "credit card payment thank you", "visa payment received", "mastercard payment received",
