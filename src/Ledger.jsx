@@ -5418,6 +5418,7 @@ export default function Ledger() {
         onConnectGoogle={connectGoogle} onDisconnectGoogle={disconnectGoogle}
         onConnectDropbox={connectDropbox} onDisconnectDropbox={disconnectDropbox}
         onSyncNowToCloud={syncNowToCloud} onPullFromCloud={pullFromCloud}
+        showToast={showToast}
       />}
       {toastMessage && (
         <div className="ledger-no-print" style={{ position: "fixed", left: "50%", bottom: "24px", transform: "translateX(-50%)", zIndex: 10000, background: "var(--text-primary)", color: "var(--surface-1)", fontSize: "13px", fontWeight: 500, padding: "10px 18px", borderRadius: "var(--radius)", boxShadow: "0 6px 20px rgba(0,0,0,0.25)" }}>
@@ -5507,6 +5508,7 @@ function SettingsTab({
   cloudProvider, setCloudProvider, cloudClientId, setCloudClientId, dropboxAppKey, setDropboxAppKey,
   cloudPassphrase, setCloudPassphrase, googleConnected, dropboxConnected, cloudStatus, cloudStatusMessage, cloudLastSynced, dropboxLastSynced,
   onConnectGoogle, onDisconnectGoogle, onConnectDropbox, onDisconnectDropbox, onSyncNowToCloud, onPullFromCloud,
+  showToast,
 }) {
   const [newCat, setNewCat] = useState("");
   const [newCatBehavior, setNewCatBehavior] = useState("expense");
@@ -5515,6 +5517,33 @@ function SettingsTab({
   const [ruleSearch, setRuleSearch] = useState("");
   const [newRuleKey, setNewRuleKey] = useState("");
   const [newRuleCat, setNewRuleCat] = useState("");
+  const [bulkRulesText, setBulkRulesText] = useState("");
+
+  // Bulk import: accepts a 2D JSON array of [merchant text or /regex/, category] pairs, applying each
+  // one through addLookupRule so plain text still gets normalize()'d, regex keys stay untouched, and
+  // duplicates overwrite in place exactly like the single-rule "Add" button above.
+  function importBulkRules() {
+    let parsed;
+    try {
+      parsed = JSON.parse(bulkRulesText);
+    } catch {
+      alert('Couldn\'t parse that as JSON. Expected a 2D array like [["merchant text", "Category Name"], ...]');
+      return;
+    }
+    if (!Array.isArray(parsed)) {
+      alert("Expected a JSON array of [merchant, category] pairs.");
+      return;
+    }
+    let imported = 0;
+    let skipped = 0;
+    for (const entry of parsed) {
+      if (!Array.isArray(entry) || entry.length < 2 || !addLookupRule(entry[0], entry[1])) skipped++;
+      else imported++;
+    }
+    setBulkRulesText("");
+    const summary = `Imported ${imported} rule${imported === 1 ? "" : "s"}${skipped ? ` (${skipped} skipped)` : ""}.`;
+    if (showToast) showToast(summary); else alert(summary);
+  }
 
   // Plain keys are already stored lowercased (normalize()), but a regex-shaped key (v6.3+) is kept
   // exactly as typed so its pattern isn't corrupted - so the search itself needs to lowercase k here
@@ -5580,6 +5609,14 @@ function SettingsTab({
             {allCategories.map(c => <option key={c} value={c}>{c}</option>)}
           </select>
           <button style={btnPrimary} onClick={() => { if (addLookupRule(newRuleKey, newRuleCat)) { setNewRuleKey(""); setNewRuleCat(""); } }}><Plus size={14} /> Add</button>
+        </div>
+        <div style={{ marginBottom: "12px" }}>
+          <textarea value={bulkRulesText} onChange={e => setBulkRulesText(e.target.value)} rows={4}
+            placeholder='Bulk import: [["merchant text", "Category Name"], ["/^uber\s*eats/i", "Dining"]]'
+            style={{ ...input, width: "100%", fontFamily: "var(--font-mono)", resize: "vertical" }} />
+          <button style={{ ...btn, marginTop: "6px" }} onClick={importBulkRules} disabled={!bulkRulesText.trim()}>
+            <Plus size={14} /> Import Rules
+          </button>
         </div>
         <div style={{ overflowX: "auto", overflowY: "auto", maxHeight: "420px" }}>
           <table style={{ width: "100%", borderCollapse: "collapse" }}>
