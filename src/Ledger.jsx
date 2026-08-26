@@ -5501,6 +5501,32 @@ async function clearCacheAndHardReset() {
   window.location.reload(true);
 }
 
+// Settings > "LLM Guides & Prompts": pre-written system prompts a user can hand to an outside LLM
+// (Claude, ChatGPT, ...) so its output lands in exactly the shape our own bulk-import tools expect -
+// the merchant-rules JSON 2D array (addLookupRule, see the bulk importer above) and the Log tab's
+// Bulk Paste TSV format. The category list is baked into the first prompt so the LLM never invents a
+// category name that doesn't actually exist in this ledger.
+function buildMerchantRulesPrompt(categoryList) {
+  return `I need to create auto-categorization rules for my budgeting app. Analyze the data I provide and identify recurring merchants. Output the result STRICTLY as a raw JSON 2D array in this format: [["merchant keyword or /regex/i", "Category Name"]].
+The category MUST be an exact match to one of these: ${categoryList}.
+Do not include markdown blocks, conversational text, or headers. Output ONLY the raw JSON array.`;
+}
+
+const TXN_FORMAT_PROMPT = `Please clean up and format the following raw bank data so I can bulk paste it into my budgeting app.
+Output the data as plain text, Tab-Separated Values (TSV) with exactly 4 columns: Date, Description, Merchant, Amount.
+- Date MUST be YYYY-MM-DD.
+- Amount MUST be a number (no dollar signs). Expenses must be negative (e.g., -45.00), income must be positive (e.g., 1200.00).
+- Do NOT include a header row.
+- Do NOT wrap in markdown formatting.`;
+
+// Shared by both "Copy Prompt" buttons below - same clipboard-write-with-fallback pattern already
+// used for "Copy unmatched for LLM" on the Log tab's staging table.
+function copyPromptToClipboard(text, showToast) {
+  navigator.clipboard?.writeText(text)
+    ?.then(() => { if (showToast) showToast("Prompt copied to clipboard."); })
+    ?.catch(() => alert("Couldn't copy automatically - your browser blocked clipboard access. Select the text manually instead."));
+}
+
 function SettingsTab({
   spendingCategories, addCategory, renameCategory, removeCategory, categoryBehaviors, setCategoryBehavior, lookup, allCategories, addLookupRule, updateLookupRuleCategory, removeLookupRule,
   recurringConfig, updateRecurringConfig, resetRecurringConfig,
@@ -5682,6 +5708,41 @@ function SettingsTab({
         onConnectDropbox={onConnectDropbox} onDisconnectDropbox={onDisconnectDropbox}
         onSyncNow={onSyncNowToCloud} onPullFromCloud={onPullFromCloud}
       />
+
+      <div style={card}>
+        <div style={{ ...label, marginBottom: "10px" }}>LLM Guides & Prompts</div>
+        <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 12px" }}>
+          Copy-pasteable system prompts that configure an outside LLM (Claude, ChatGPT, etc.) to output
+          data in the exact formats this app's ingestion tools expect - hand the LLM your raw bank data
+          or export alongside one of these, then paste its response straight into the matching tool.
+        </p>
+
+        <div style={{ marginBottom: "16px" }}>
+          <div style={{ fontSize: "13px", fontWeight: 500, marginBottom: "6px" }}>Generate merchant rules</div>
+          <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 8px" }}>
+            Paste this alongside a list of merchants/transactions, then feed the LLM's JSON output into
+            "Import Rules" above.
+          </p>
+          <textarea readOnly value={buildMerchantRulesPrompt(allCategories.join(", "))} rows={6}
+            style={{ ...input, width: "100%", fontFamily: "var(--font-mono)", resize: "vertical" }} />
+          <button style={{ ...btn, marginTop: "6px" }} onClick={() => copyPromptToClipboard(buildMerchantRulesPrompt(allCategories.join(", ")), showToast)}>
+            <Copy size={13} /> Copy Prompt
+          </button>
+        </div>
+
+        <div>
+          <div style={{ fontSize: "13px", fontWeight: 500, marginBottom: "6px" }}>Format transactions for Bulk Paste</div>
+          <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "0 0 8px" }}>
+            Paste this alongside raw bank data, then feed the LLM's TSV output into the Log tab's "Bulk
+            Paste (CSV/TSV)" tool.
+          </p>
+          <textarea readOnly value={TXN_FORMAT_PROMPT} rows={6}
+            style={{ ...input, width: "100%", fontFamily: "var(--font-mono)", resize: "vertical" }} />
+          <button style={{ ...btn, marginTop: "6px" }} onClick={() => copyPromptToClipboard(TXN_FORMAT_PROMPT, showToast)}>
+            <Copy size={13} /> Copy Prompt
+          </button>
+        </div>
+      </div>
 
       <div style={card}>
         <div style={{ ...label, marginBottom: "10px" }}>Storage & Cache Management</div>
