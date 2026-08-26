@@ -3974,6 +3974,7 @@ export default function Ledger() {
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [quickMonth, setQuickMonth] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
 
@@ -4351,8 +4352,16 @@ export default function Ledger() {
     if (filterAccount !== "all") rows = rows.filter(t => t.account === filterAccount);
     if (dateFrom) rows = rows.filter(t => t.date >= dateFrom);
     if (dateTo) rows = rows.filter(t => t.date <= dateTo);
+    if (searchQuery) {
+      const q = searchQuery.trim().toLowerCase();
+      rows = rows.filter(t =>
+        (t.merchant || "").toLowerCase().includes(q) ||
+        (t.description || "").toLowerCase().includes(q) ||
+        String(Math.abs(t.amount)).includes(searchQuery.trim())
+      );
+    }
     return rows;
-  }, [transactions, filterCat, filterAccount, dateFrom, dateTo]);
+  }, [transactions, filterCat, filterAccount, dateFrom, dateTo, searchQuery]);
 
   const sortedTxns = useMemo(() => {
     const dir = sortDir === "asc" ? 1 : -1;
@@ -4377,11 +4386,11 @@ export default function Ledger() {
 
   // Reset to page 1 whenever the filtered/sorted set or page size changes, so the pager never
   // silently strands the person on a now out-of-range page.
-  useEffect(() => { setPage(1); }, [filterCat, filterAccount, dateFrom, dateTo, sortKey, sortDir, pageSize]);
+  useEffect(() => { setPage(1); }, [filterCat, filterAccount, dateFrom, dateTo, searchQuery, sortKey, sortDir, pageSize]);
   // Clear bulk selection when the underlying filtered set changes (not on sort/page-size, which
   // don't change what's included) - a selection built under one filter shouldn't silently carry
   // over and get applied to a different-looking result set.
-  useEffect(() => { setSelectedTxnIds(new Set()); }, [filterCat, filterAccount, dateFrom, dateTo]);
+  useEffect(() => { setSelectedTxnIds(new Set()); }, [filterCat, filterAccount, dateFrom, dateTo, searchQuery]);
   const totalPages = Math.max(1, Math.ceil(sortedTxns.length / pageSize));
   // Also clamp defensively if the set shrinks for some other reason (e.g. a backup restore) without
   // one of the deps above changing.
@@ -4908,7 +4917,14 @@ export default function Ledger() {
                 <input type="date" value={dateFrom} onChange={e => { setDateFrom(e.target.value); setQuickMonth(""); }} style={{ ...input, width: "140px" }} />
                 <span style={{ fontSize: "12px", color: "var(--text-muted)" }}>to</span>
                 <input type="date" value={dateTo} onChange={e => { setDateTo(e.target.value); setQuickMonth(""); }} style={{ ...input, width: "140px" }} />
-                {(dateFrom || dateTo) && <button style={{ ...btn, padding: "4px 10px" }} onClick={() => { setDateFrom(""); setDateTo(""); setQuickMonth(""); }}>Clear dates</button>}
+                <input type="text" value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
+                  placeholder="Search merchant or amount..." style={{ ...input, width: "200px" }} />
+                {(dateFrom || dateTo || searchQuery) && (
+                  <button style={{ ...btn, padding: "4px 10px" }}
+                    onClick={() => { setDateFrom(""); setDateTo(""); setQuickMonth(""); setSearchQuery(""); }}>
+                    Clear filters
+                  </button>
+                )}
                 {transactions.length > 0 && (
                   <button style={{ ...btn, padding: "4px 10px" }} onClick={openDuplicateScanner}>
                     <ScanSearch size={13} /> Scan Duplicates
