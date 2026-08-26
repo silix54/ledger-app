@@ -32,6 +32,18 @@ const DEFAULT_SPENDING_CATEGORIES = ["Giving","Groceries","Dining","Health","Pha
   "Utilities","Hardware"];
 const NON_SPEND = new Set(SYSTEM_CATEGORIES);
 const INCOME_CATS = new Set(["INCOME: Employment","INCOME: Benefits","INCOME: Reimbursement","INCOME: Resale"]);
+// Dynamic income categories: a person can add any custom category via Settings > Manage categories,
+// and defaultCategoryBehavior already treats a name starting with "INCOME:" as income behavior-wise
+// (see below). These two helpers keep every *other* income-adjacent check - CategoryBadge's color,
+// monthlyTrend/incomeBySource, and the NON_SPEND-based spend exclusions - in sync with that same rule,
+// so a custom "INCOME: E-transfer" category doesn't need to be one of the four hardcoded INCOME_CATS
+// to be recognized as income everywhere in the app.
+function isIncomeCategory(cat) {
+  return INCOME_CATS.has(cat) || (cat && cat.startsWith("INCOME:"));
+}
+function isNonSpendCategory(cat) {
+  return NON_SPEND.has(cat) || (cat && cat.startsWith("INCOME:"));
+}
 
 // --- Sign-resilient category classification (Dashboard Overhaul + Customizable Category Behaviors) --
 // Classifies a transaction into "income" | "expense" | "investment" | "neutral" using each category's
@@ -133,7 +145,11 @@ function isValidTransaction(t) {
     // into across categories (see splitTransaction/mergeSplitGroup below). It's the id the parent
     // row had before the split replaced it, which stays a safe, never-reused reference even after
     // that row is gone, since computeNextId only ever hands out ids larger than any id seen so far.
-    && (t.splitParentId === null || t.splitParentId === undefined || Number.isFinite(t.splitParentId));
+    && (t.splitParentId === null || t.splitParentId === undefined || Number.isFinite(t.splitParentId))
+    // notes is optional and additive, same reasoning as account above - a free-text field for
+    // anything the merchant/category/description don't capture (a reason, a reminder, context for
+    // later). Old data simply won't have it.
+    && (t.notes === null || t.notes === undefined || typeof t.notes === "string");
 }
 // True for a transaction that's one part of a split - grouped with its siblings by splitParentId
 // (the original, now-retired transaction id they were divided out of).
@@ -1783,7 +1799,7 @@ function DuplicateCleanerModal({ clusters, onConfirm, onCancel }) {
 
 function CategoryBadge({ category }) {
   let bg = "var(--bg-accent)", fg = "var(--text-accent)";
-  if (INCOME_CATS.has(category)) { bg = "var(--bg-success)"; fg = "var(--text-success)"; }
+  if (isIncomeCategory(category)) { bg = "var(--bg-success)"; fg = "var(--text-success)"; }
   else if (category && category.startsWith("TRANSFER")) { bg = "var(--surface-0)"; fg = "var(--text-muted)"; }
   else if (category === "REVIEW: Ambiguous" || !category) { bg = "var(--bg-warning)"; fg = "var(--text-warning)"; }
   return <span style={{ background: bg, color: fg, fontSize: "11px", padding: "2px 8px", borderRadius: "999px", whiteSpace: "nowrap" }}>{category || "unmatched"}</span>;
@@ -2044,6 +2060,7 @@ function ManualTransactionForm({ categories, lookup, addCategory, onStage, onAdd
   const [newCategoryName, setNewCategoryName] = useState("");
   const [txnType, setTxnType] = useState("expense"); // "expense" | "income" - drives the amount's sign
   const [amountText, setAmountText] = useState("");
+  const [notes, setNotes] = useState("");
 
   // Live categorization: the exact same regex/substring rules engine every keystroke that staging's
   // "suggested" column already uses (see categorize()/stageRows above).
@@ -2065,6 +2082,7 @@ function ManualTransactionForm({ categories, lookup, addCategory, onStage, onAdd
     setNewCategoryName("");
     setTxnType("expense");
     setAmountText("");
+    setNotes("");
   }
 
   // Lets the person undo a manual category pick and go back to live auto-detection without touching
@@ -2090,7 +2108,8 @@ function ManualTransactionForm({ categories, lookup, addCategory, onStage, onAdd
     const magnitude = parseFloat(amountText);
     const amount = Number.isFinite(magnitude) ? (txnType === "expense" ? -Math.abs(magnitude) : Math.abs(magnitude)) : NaN;
     const desc = description.trim();
-    return { date, description: desc, merchant: desc, amount, category, account: account.trim() || null };
+    const trimmedNotes = notes.trim();
+    return { date, description: desc, merchant: desc, amount, category, account: account.trim() || null, notes: trimmedNotes || null };
   }
 
   // Persists whatever account was actually used on a successful save, not on every keystroke - "last
@@ -2183,6 +2202,11 @@ function ManualTransactionForm({ categories, lookup, addCategory, onStage, onAdd
           <div style={label}>Amount</div>
           <input type="number" inputMode="decimal" step="0.01" min="0" value={amountText} onChange={e => setAmountText(e.target.value)} placeholder="0.00" style={input} />
         </div>
+      </div>
+
+      <div>
+        <div style={label}>Notes (optional)</div>
+        <input type="text" value={notes} onChange={e => setNotes(e.target.value)} placeholder="e.g. Split with roommate, reimbursed later" style={input} />
       </div>
 
       <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
@@ -3265,6 +3289,7 @@ export default function Ledger() {
     const committed = toCommit.map(r => ({
       id: nextId.current++, date: r.date, description: r.description,
       merchant: r.merchant, amount: r.amount, category: r.category || null, account: r.account ?? null,
+      notes: r.notes || null, // undefined (bulk/CSV staging never sets it) and "" both collapse to null
     }));
     if (corrections.size) {
       setLookup(prev => sortLookup([...corrections.entries(), ...prev.filter(([k]) => !corrections.has(k))]));
@@ -3326,7 +3351,7 @@ export default function Ledger() {
     setStaging(prev => [...prev, {
       stageId: nextStageId.current++, date: row.date, description: row.description,
       merchant: row.merchant, amount: row.amount, suggested, category: row.category, matched: true,
-      account: row.account ?? null,
+      account: row.account ?? null, notes: row.notes ?? null,
       isDuplicate: false, included: true, // already confirmed via confirmIfDuplicate above
     }]);
     return true;
@@ -3344,7 +3369,7 @@ export default function Ledger() {
     }
     setTransactions(prev => [...prev, {
       id: nextId.current++, date: row.date, description: row.description, merchant: row.merchant,
-      amount: row.amount, category: row.category, account: row.account ?? null,
+      amount: row.amount, category: row.category, account: row.account ?? null, notes: row.notes ?? null,
     }]);
     return true;
   }
@@ -3801,7 +3826,7 @@ export default function Ledger() {
   // category it happens to be filed under. Everything else that's an expense in the current window is
   // discretionary. Investment contributions are excluded automatically (classifyTxnKind returns
   // "investment", not "expense", for them) same as in the category ranking above.
-  const recurring = useMemo(() => detectRecurring(transactions.filter(t => t.category && !NON_SPEND.has(t.category)), recurringConfig), [transactions, recurringConfig]);
+  const recurring = useMemo(() => detectRecurring(transactions.filter(t => t.category && !isNonSpendCategory(t.category)), recurringConfig), [transactions, recurringConfig]);
   const dashFixedMerchants = useMemo(() => new Set(recurring.map(r => r.merchant)), [recurring]);
   const dashFixedVsDiscretionary = useMemo(() => {
     let fixed = 0, discretionary = 0;
@@ -3842,8 +3867,8 @@ export default function Ledger() {
 
   const monthlyTrend = useMemo(() => months.map(m => {
     const inMonth = transactions.filter(t => t.date.slice(0, 7) === m);
-    const spend = inMonth.filter(t => t.category && !NON_SPEND.has(t.category)).reduce((s, t) => s - t.amount, 0);
-    const income = inMonth.filter(t => t.category && INCOME_CATS.has(t.category)).reduce((s, t) => s + t.amount, 0);
+    const spend = inMonth.filter(t => t.category && !isNonSpendCategory(t.category)).reduce((s, t) => s - t.amount, 0);
+    const income = inMonth.filter(t => t.category && isIncomeCategory(t.category)).reduce((s, t) => s + t.amount, 0);
     return { month: m, spend: Math.round(spend), income: Math.round(income) };
   }), [transactions, months]);
 
@@ -3852,7 +3877,7 @@ export default function Ledger() {
   const categoryBreakdown = useMemo(() => {
     const totals = freshTally();
     dashboardTxns.forEach(t => {
-      if (!t.category || NON_SPEND.has(t.category)) return;
+      if (!t.category || isNonSpendCategory(t.category)) return;
       totals[t.category] = (totals[t.category] || 0) - t.amount;
     });
     return Object.entries(totals).map(([category, total]) => ({ category, total: Math.round(total) })).sort((a, b) => b.total - a.total);
@@ -3869,7 +3894,7 @@ export default function Ledger() {
   const incomeBySource = useMemo(() => {
     const totals = freshTally();
     dashboardTxns.forEach(t => {
-      if (!t.category || !INCOME_CATS.has(t.category)) return;
+      if (!t.category || !isIncomeCategory(t.category)) return;
       totals[t.category] = (totals[t.category] || 0) + t.amount;
     });
     // fullCategory keeps the real "INCOME: X" category alongside the shortened display label, so a
@@ -3903,7 +3928,7 @@ export default function Ledger() {
   // number this data model can honestly produce yet.
   const currentMonthKey = new Date().toISOString().slice(0, 7);
   const actualSpendThisMonth = transactions
-    .filter(t => t.date.slice(0, 7) === currentMonthKey && t.category && !NON_SPEND.has(t.category))
+    .filter(t => t.date.slice(0, 7) === currentMonthKey && t.category && !isNonSpendCategory(t.category))
     .reduce((s, t) => s - t.amount, 0);
   const plannedMonthlyTotal = committedCostsTotal + budget.discretionary;
   const monthVariance = plannedMonthlyTotal - actualSpendThisMonth;
@@ -3987,7 +4012,7 @@ export default function Ledger() {
   function startTxnEdit(t) {
     setSplittingTxnId(null);
     setEditingTxnId(t.id);
-    setEditDraft({ date: t.date, merchant: t.merchant, amount: String(t.amount), category: t.category || "", account: t.account || "" });
+    setEditDraft({ date: t.date, merchant: t.merchant, amount: String(t.amount), category: t.category || "", account: t.account || "", notes: t.notes || "" });
   }
   function cancelTxnEdit() {
     setEditingTxnId(null);
@@ -4003,7 +4028,7 @@ export default function Ledger() {
       return;
     }
     const id = editingTxnId;
-    setTransactions(prev => prev.map(t => t.id === id ? { ...t, date, merchant, amount, category: editDraft.category || null, account: editDraft.account.trim() || null } : t));
+    setTransactions(prev => prev.map(t => t.id === id ? { ...t, date, merchant, amount, category: editDraft.category || null, account: editDraft.account.trim() || null, notes: editDraft.notes.trim() || null } : t));
     setEditingTxnId(null);
     setEditDraft(null);
   }
@@ -5010,7 +5035,11 @@ export default function Ledger() {
                         <tr key={t.id}>
                           <td style={td}><input type="checkbox" checked={selectedTxnIds.has(t.id)} disabled /></td>
                           <td style={td}><input type="date" value={editDraft.date} onChange={e => setEditDraft(d => ({ ...d, date: e.target.value }))} style={input} /></td>
-                          <td style={td}><input value={editDraft.merchant} onChange={e => setEditDraft(d => ({ ...d, merchant: e.target.value }))} style={input} /></td>
+                          <td style={td}>
+                            <input value={editDraft.merchant} onChange={e => setEditDraft(d => ({ ...d, merchant: e.target.value }))} style={input} />
+                            <input type="text" value={editDraft.notes} onChange={e => setEditDraft(d => ({ ...d, notes: e.target.value }))}
+                              placeholder="Notes (optional)" style={{ ...input, marginTop: "4px", fontSize: "12px" }} />
+                          </td>
                           <td style={{ ...td, textAlign: "right" }}>
                             <input type="number" step="0.01" value={editDraft.amount} onChange={e => setEditDraft(d => ({ ...d, amount: e.target.value }))} style={{ ...input, textAlign: "right" }} />
                           </td>
@@ -5039,6 +5068,7 @@ export default function Ledger() {
                         <td style={td}>
                           {t.merchant}
                           {splitChild && <span style={{ fontSize: "11px", color: "var(--text-muted)", marginLeft: "6px" }} title="One part of a split transaction">(split, {siblingCount} parts)</span>}
+                          {t.notes && <div style={{ fontSize: "11px", fontStyle: "italic", color: "var(--text-muted)", marginTop: "2px" }}>{t.notes}</div>}
                         </td>
                         <td style={{ ...td, textAlign: "right", ...num, color: t.amount < 0 ? "var(--text-primary)" : "var(--text-success)" }}>{t.amount < 0 ? "-" : "+"}${Math.abs(t.amount).toFixed(2)}</td>
                         <td style={td}><CategoryBadge category={t.category} /></td>
